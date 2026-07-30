@@ -21,7 +21,9 @@ from pathlib import Path
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
+from diffusion_policy.env.robomimic.seeded_robomimic_image_wrapper import (
+    SeededRobomimicImageWrapper,
+)
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -46,7 +48,7 @@ def create_env(split, env_name, seed=None):
     return env
 
 
-class RobomimicImageRunner(BaseImageRunner):
+class SeededRobomimicImageRunner(BaseImageRunner):
     """
     Robomimic envs already enforces number of steps.
     """
@@ -92,12 +94,13 @@ class RobomimicImageRunner(BaseImageRunner):
 
         def env_fn(env_i):
             # set seed for env appropriately
-            if "seed" in self.env_kwargs:
-                self.env_kwargs["seed"] += env_i
+            env_seed = self.env_kwargs.get("seed", None)
+            if env_seed is not None:
+                env_seed += env_i
             robocasa_env = create_env(
                 split=self.env_kwargs["split"], 
                 env_name=self.env_kwargs["env_name"],
-                seed=self.env_kwargs.get("seed", None)
+                seed=env_seed,
             )
             # Robosuite's hard reset causes excessive memory consumption.
             # Disabled to run more envs.
@@ -105,7 +108,7 @@ class RobomimicImageRunner(BaseImageRunner):
             # robocasa_env.env.hard_reset = False
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    SeededRobomimicImageWrapper(
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -139,7 +142,7 @@ class RobomimicImageRunner(BaseImageRunner):
             )
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    SeededRobomimicImageWrapper(
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -188,9 +191,9 @@ class RobomimicImageRunner(BaseImageRunner):
                     env.env.file_path = filename
 
                 # switch to seed reset
-                assert isinstance(env.env.env, RobomimicImageWrapper)
+                assert isinstance(env.env.env, SeededRobomimicImageWrapper)
                 env.env.env.init_state = None
-                # env.seed(seed)
+                env.env.env.set_reset_seed(seed)
 
             env_seeds.append(seed)
             env_prefixs.append('test/')
@@ -316,6 +319,8 @@ class RobomimicImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
+        log_data['evaluation/environment_seeds'] = list(self.env_seeds)
+        log_data['evaluation/explicit_seed_reset'] = True
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
         # fortunately this won't invalidate our conclusion since

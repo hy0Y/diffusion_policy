@@ -1,0 +1,12 @@
+# @package _global_
+experiment:
+  name: e2_d_u
+
+policy:
+  semantic_enabled: true
+  direct_boundary_enabled: true
+  bifurcation_enabled: false
+  train_diffusion: true
+  freeze_transformer: false
+  direct_subtask_loss_weight: 0.25
+  direct_stage_loss_weight: 0.25
