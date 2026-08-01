@@ -9,6 +9,7 @@ from diffusion_policy.dataset.p1_mvp_group_dataset import (
     CachedEpisodeStore,
     GroupSampleIndex,
     P1MVPCachedGroupDataset,
+    P1MVPRawGroupDataset,
     shared_physical_time_noise,
 )
 
@@ -24,6 +25,8 @@ def make_fixture(tmp_path):
     boundary[12] = True
     pq.write_table(
         pa.table({
+            "frame_index": np.arange(frame_count, dtype=np.int64),
+            "subtask_idx": np.arange(frame_count, dtype=np.int64) // 10,
             "boundary_any_hard": boundary,
             "stage_local_id": np.arange(frame_count, dtype=np.int64),
             "semantic_skill_local_id": np.arange(frame_count, dtype=np.int64) + 100,
@@ -46,6 +49,36 @@ def make_fixture(tmp_path):
         },
     }))
     return artifact, features, actions, boundary
+
+
+class FakeRawDataset(torch.utils.data.Dataset):
+    n_obs_steps = 2
+    trajectory_ids = np.array([7], dtype=np.int64)
+    start_indices = np.array([0], dtype=np.int64)
+    all_steps = [(7, index) for index in range(40)]
+
+    def __init__(self):
+        self.requested = []
+
+    def __len__(self):
+        return 40
+
+    def get_trajectory_index(self, episode_id):
+        assert episode_id == 7
+        return 0
+
+    def __getitem__(self, index):
+        self.requested.append(index)
+        return {
+            "obs": {
+                "state": torch.tensor(
+                    [[index - 1.0], [index]], dtype=torch.float32),
+            },
+            "action": torch.full((10, 12), float(index)),
+        }
+
+    def get_normalizer(self, **kwargs):
+        return ("normalizer", kwargs)
 
 
 def test_cached_group_uses_physical_time_contract(tmp_path):
@@ -73,6 +106,22 @@ def test_dataset_accepts_group_index(tmp_path):
     assert item["action"].shape == (4, 10, 12)
     assert item["boundary_edge_target"].shape == (4, 9)
     assert item["category"] == "episode_start"
+
+
+def test_raw_dataset_maps_group_start_to_observation_anchor(tmp_path):
+    artifact, _, _, boundary = make_fixture(tmp_path)
+    base = FakeRawDataset()
+    dataset = P1MVPRawGroupDataset(base, artifact, split="train")
+    item = dataset[GroupSampleIndex(7, 0, "episode_start")]
+
+    assert base.requested == [1, 6, 11, 16]
+    assert item["obs"]["state"].shape == (4, 2, 1)
+    assert item["action"].shape == (4, 10, 12)
+    assert item["action"][:, 0, 0].tolist() == [1.0, 6.0, 11.0, 16.0]
+    np.testing.assert_array_equal(
+        item["boundary_edge_target"][0].numpy(), boundary[1:10])
+    assert item["subtask_idx"].shape == (4, 10)
+    assert dataset.get_normalizer(probe=True) == ("normalizer", {"probe": True})
 
 
 def test_overlap_uses_exact_same_noise():

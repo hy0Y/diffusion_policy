@@ -8,6 +8,7 @@ be supplied by the experiment config.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from pathlib import Path
 from typing import Any
@@ -205,3 +206,139 @@ class P1MVPCachedGroupDataset(Dataset):
             "semantic_skill_local_id": torch.from_numpy(
                 group.semantic_skill_local_id.copy()),
         }
+
+
+class P1MVPRawGroupDataset(Dataset):
+    """Primary raw-observation wrapper using the same physical group indices.
+
+    ``base_dataset`` must be one GetToastedBread ``LerobotDataset`` configured
+    with ``horizon=10`` and ``n_obs_steps=2``. A local index ``r`` in that dataset
+    produces observation context ``[o_{r-1}, o_r]`` and action window
+    ``[a_{r-1}, ..., a_{r+8}]``. Therefore the group window whose physical action
+    start is ``s`` is fetched at ``r=s+1``.
+    """
+
+    def __init__(
+            self,
+            base_dataset: Dataset,
+            split_artifact: str | Path,
+            *,
+            split: str,
+        ):
+        super().__init__()
+        artifact_path = Path(split_artifact)
+        manifest = json.loads(artifact_path.read_text(encoding="utf-8"))
+        if split not in ("train", "validation", "test"):
+            raise ValueError("split must be train, validation, or test")
+        if manifest.get("split_id") != "gettoastedbread_mvp_intersection_v1":
+            raise ValueError("unexpected P1 MVP split_id")
+        if getattr(base_dataset, "n_obs_steps", None) != 2:
+            raise ValueError("P1 raw group dataset requires n_obs_steps=2")
+
+        self.base_dataset = base_dataset
+        self.artifact_path = artifact_path
+        self.split_id = manifest["split_id"]
+        self.episode_ids = tuple(
+            int(value) for value in manifest["episodes"][split]
+        )
+        self.annotation_root = Path(manifest["source"]["annotation_root"])
+        available_ids = getattr(base_dataset, "trajectory_ids", None)
+        if available_ids is None:
+            raise TypeError("base_dataset must expose trajectory_ids")
+        missing = sorted(set(self.episode_ids) - set(int(x) for x in available_ids))
+        if missing:
+            raise ValueError(f"base dataset is missing locked episodes: {missing[:10]}")
+
+    def __len__(self) -> int:
+        return len(self.episode_ids)
+
+    def _global_index(self, episode_id: int, observation_anchor: int) -> int:
+        trajectory_index = self.base_dataset.get_trajectory_index(episode_id)
+        start_indices = getattr(self.base_dataset, "start_indices", None)
+        if start_indices is None:
+            raise TypeError("base_dataset must expose start_indices")
+        global_index = int(start_indices[trajectory_index] + observation_anchor)
+        all_steps = getattr(self.base_dataset, "all_steps", None)
+        if all_steps is not None:
+            observed_episode, observed_anchor = all_steps[global_index]
+            if (int(observed_episode), int(observed_anchor)) != (
+                episode_id, observation_anchor
+            ):
+                raise AssertionError("base dataset episode/local-index mapping drifted")
+        return global_index
+
+    @lru_cache(maxsize=8)
+    def _load_annotation(self, episode_id: int) -> dict[str, np.ndarray]:
+        path = self.annotation_root / f"episode_{episode_id:06d}.parquet"
+        columns = [
+            "frame_index",
+            "subtask_idx",
+            "stage_local_id",
+            "semantic_skill_local_id",
+            "boundary_any_hard",
+        ]
+        table = pq.read_table(path, columns=columns)
+        result = {
+            name: table[name].to_numpy(zero_copy_only=False) for name in columns
+        }
+        if not np.array_equal(result["frame_index"], np.arange(table.num_rows)):
+            raise ValueError(f"invalid annotation frame_index: {path}")
+        return result
+
+    def __getitem__(self, index: GroupSampleIndex) -> dict[str, Any]:
+        if not isinstance(index, GroupSampleIndex):
+            raise TypeError("P1MVPRawGroupDataset expects GroupSampleIndex values")
+        if index.episode_id not in self.episode_ids:
+            raise KeyError(f"episode {index.episode_id} is not in this split")
+
+        window_starts = index.group_start + np.arange(GROUP_WINDOWS) * GROUP_STRIDE
+        observation_anchors = window_starts + 1
+        samples = [
+            self.base_dataset[
+                self._global_index(index.episode_id, int(observation_anchor))
+            ]
+            for observation_anchor in observation_anchors
+        ]
+        obs_keys = tuple(samples[0]["obs"])
+        if any(tuple(sample["obs"]) != obs_keys for sample in samples[1:]):
+            raise ValueError("raw group windows have inconsistent observation keys")
+        observation = {
+            key: torch.stack([sample["obs"][key] for sample in samples])
+            for key in obs_keys
+        }
+        clean_actions = torch.stack([sample["action"] for sample in samples])
+        if clean_actions.shape[-2:] != (GROUP_WINDOW, 12):
+            raise ValueError(
+                f"raw action group must end in {(GROUP_WINDOW, 12)}, "
+                f"got {clean_actions.shape}")
+
+        physical_time = window_starts[:, None] + np.arange(GROUP_WINDOW)[None, :]
+        annotation = self._load_annotation(index.episode_id)
+        frame_count = len(annotation["frame_index"])
+        if int(physical_time.max()) >= frame_count:
+            raise IndexError(
+                f"group [{index.group_start},{index.group_start + GROUP_UNION - 1}] "
+                f"is outside T={frame_count}")
+        edge_endpoint = physical_time[:, :-1] + 1
+        return {
+            "episode_id": torch.tensor(index.episode_id, dtype=torch.long),
+            "group_start": torch.tensor(index.group_start, dtype=torch.long),
+            "category": index.category,
+            "physical_time": torch.from_numpy(physical_time.astype(np.int64)),
+            "observation_anchor": torch.from_numpy(
+                observation_anchors.astype(np.int64)),
+            "obs": observation,
+            "action": clean_actions,
+            "boundary_edge_target": torch.from_numpy(
+                np.asarray(annotation["boundary_any_hard"])[edge_endpoint].copy()),
+            "subtask_idx": torch.from_numpy(
+                np.asarray(annotation["subtask_idx"])[physical_time].copy()),
+            "stage_local_id": torch.from_numpy(
+                np.asarray(annotation["stage_local_id"])[physical_time].copy()),
+            "semantic_skill_local_id": torch.from_numpy(
+                np.asarray(annotation["semantic_skill_local_id"])[
+                    physical_time].copy()),
+        }
+
+    def get_normalizer(self, **kwargs):
+        return self.base_dataset.get_normalizer(**kwargs)
