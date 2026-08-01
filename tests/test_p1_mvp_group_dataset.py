@@ -106,6 +106,7 @@ def test_dataset_accepts_group_index(tmp_path):
     assert item["action"].shape == (4, 10, 12)
     assert item["boundary_edge_target"].shape == (4, 9)
     assert item["category"] == "episode_start"
+    assert item["episode_valid"].item()
 
 
 def test_raw_dataset_maps_group_start_to_observation_anchor(tmp_path):
@@ -121,6 +122,7 @@ def test_raw_dataset_maps_group_start_to_observation_anchor(tmp_path):
     np.testing.assert_array_equal(
         item["boundary_edge_target"][0].numpy(), boundary[1:10])
     assert item["subtask_idx"].shape == (4, 10)
+    assert item["episode_valid"].item()
     assert dataset.get_normalizer(probe=True) == ("normalizer", {"probe": True})
 
 

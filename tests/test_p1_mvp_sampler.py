@@ -6,6 +6,7 @@ from diffusion_policy.dataset.p1_mvp_sampler import (
     EpisodeBundleSampler,
     EpisodePools,
     intervals_overlap,
+    partition_epoch_for_ddp,
 )
 
 
@@ -75,3 +76,35 @@ def test_resume_batch_cursor_preserves_remaining_schedule():
     full = list(EpisodeBundleBatchSampler(schedule))
     resumed = list(EpisodeBundleBatchSampler(schedule, start_batch=1))
     assert resumed == full[1:]
+
+
+def test_ddp_final_step_uses_masked_dummy_slots_without_repeating_real_data():
+    sampler = EpisodeBundleSampler(
+        FakeStore(10), seed=42, natural_done_policy="include_terminal")
+    schedule = sampler.sample_epoch(epoch=3)
+    ranks = [
+        partition_epoch_for_ddp(
+            schedule,
+            rank=rank,
+            world_size=3,
+            episodes_per_rank=4,
+        )
+        for rank in range(3)
+    ]
+
+    assert all(len(rank_schedule.batches) == 1 for rank_schedule in ranks)
+    assert [rank.real_episode_count for rank in ranks] == [4, 4, 2]
+    assert [rank.dummy_episode_count for rank in ranks] == [0, 0, 2]
+    real_episode_ids = []
+    for rank_schedule in ranks:
+        batch = rank_schedule.batches[0]
+        mask = rank_schedule.valid_episode_mask[0]
+        assert len(batch) == len(mask) == 4
+        flat_groups = list(EpisodeBundleBatchSampler(rank_schedule))[0]
+        assert len(flat_groups) == 32
+        for bundle, valid in zip(batch, mask):
+            assert all(group.valid is valid for group in bundle.groups)
+            if valid:
+                real_episode_ids.append(bundle.episode_id)
+    assert len(real_episode_ids) == 10
+    assert len(set(real_episode_ids)) == 10

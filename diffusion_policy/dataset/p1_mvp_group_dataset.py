@@ -33,6 +33,7 @@ class GroupSampleIndex:
     segment_number: int | None = None
     terminal_boundary: bool = False
     touches_done: bool = False
+    valid: bool = True
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,7 @@ class P1MVPCachedGroupDataset(Dataset):
             "episode_id": torch.tensor(group.episode_id, dtype=torch.long),
             "group_start": torch.tensor(group.group_start, dtype=torch.long),
             "category": index.category,
+            "episode_valid": torch.tensor(index.valid, dtype=torch.bool),
             "physical_time": torch.from_numpy(group.physical_time),
             "observation_anchor": torch.from_numpy(group.observation_anchors),
             "obs_feature": torch.from_numpy(group.observation_features.copy()),
@@ -324,6 +326,7 @@ class P1MVPRawGroupDataset(Dataset):
             "episode_id": torch.tensor(index.episode_id, dtype=torch.long),
             "group_start": torch.tensor(index.group_start, dtype=torch.long),
             "category": index.category,
+            "episode_valid": torch.tensor(index.valid, dtype=torch.bool),
             "physical_time": torch.from_numpy(physical_time.astype(np.int64)),
             "observation_anchor": torch.from_numpy(
                 observation_anchors.astype(np.int64)),

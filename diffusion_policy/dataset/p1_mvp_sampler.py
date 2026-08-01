@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator, Literal
 
@@ -61,6 +61,25 @@ class EpochSchedule:
     @property
     def window_count(self) -> int:
         return self.group_count * 4
+
+
+@dataclass(frozen=True)
+class RankEpochSchedule:
+    """One DDP rank's fixed-width view of a global episode-complete epoch."""
+
+    epoch: int
+    rank: int
+    world_size: int
+    batches: tuple[tuple[EpisodeBundle, ...], ...]
+    valid_episode_mask: tuple[tuple[bool, ...], ...]
+
+    @property
+    def real_episode_count(self) -> int:
+        return sum(sum(mask) for mask in self.valid_episode_mask)
+
+    @property
+    def dummy_episode_count(self) -> int:
+        return sum(len(mask) - sum(mask) for mask in self.valid_episode_mask)
 
 
 def intervals_overlap(left: int, right: int, union: int = GROUP_UNION) -> bool:
@@ -312,7 +331,12 @@ class EpisodeBundleSampler:
 class EpisodeBundleBatchSampler(Sampler[list[GroupSampleIndex]]):
     """Flatten each 4-episode physical batch to its 32 logical group instances."""
 
-    def __init__(self, schedule: EpochSchedule, *, start_batch: int = 0):
+    def __init__(
+            self,
+            schedule: EpochSchedule | RankEpochSchedule,
+            *,
+            start_batch: int = 0,
+        ):
         if not 0 <= start_batch <= len(schedule.batches):
             raise ValueError("start_batch is outside the epoch schedule")
         self.schedule = schedule
@@ -324,3 +348,64 @@ class EpisodeBundleBatchSampler(Sampler[list[GroupSampleIndex]]):
 
     def __len__(self) -> int:
         return len(self.schedule.batches) - self.start_batch
+
+
+def partition_epoch_for_ddp(
+        schedule: EpochSchedule,
+        *,
+        rank: int,
+        world_size: int,
+        episodes_per_rank: int = 4,
+    ) -> RankEpochSchedule:
+    """Partition real episodes once and mask only final-step dummy slots.
+
+    Every rank receives ``episodes_per_rank`` structurally valid bundles on every
+    step. Reused dummy bundles carry ``GroupSampleIndex.valid=False`` and must be
+    excluded from loss, metrics, and sampler coverage by the training workspace.
+    """
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must lie in [0, world_size)")
+    if episodes_per_rank <= 0:
+        raise ValueError("episodes_per_rank must be positive")
+    real_bundles = [
+        bundle for batch in schedule.batches for bundle in batch
+    ]
+    if not real_bundles:
+        raise ValueError("cannot partition an empty epoch")
+
+    global_width = world_size * episodes_per_rank
+    pad_template = real_bundles[0]
+    rank_batches: list[tuple[EpisodeBundle, ...]] = []
+    rank_masks: list[tuple[bool, ...]] = []
+    for start in range(0, len(real_bundles), global_width):
+        global_bundles = real_bundles[start:start + global_width]
+        global_valid = [True] * len(global_bundles)
+        missing = global_width - len(global_bundles)
+        global_bundles.extend([pad_template] * missing)
+        global_valid.extend([False] * missing)
+
+        local_start = rank * episodes_per_rank
+        local_stop = local_start + episodes_per_rank
+        local_valid = tuple(global_valid[local_start:local_stop])
+        local_bundles = []
+        for bundle, valid in zip(
+            global_bundles[local_start:local_stop], local_valid
+        ):
+            local_bundles.append(EpisodeBundle(
+                episode_id=bundle.episode_id,
+                groups=tuple(
+                    replace(group, valid=valid) for group in bundle.groups
+                ),
+            ))
+        rank_batches.append(tuple(local_bundles))
+        rank_masks.append(local_valid)
+
+    return RankEpochSchedule(
+        epoch=schedule.epoch,
+        rank=rank,
+        world_size=world_size,
+        batches=tuple(rank_batches),
+        valid_episode_mask=tuple(rank_masks),
+    )
