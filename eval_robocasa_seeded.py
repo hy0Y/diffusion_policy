@@ -44,6 +44,7 @@ def eval_task(
     num_envs,
     split,
     start_seed,
+    policy_start_seed,
     overwrite,
 ):
     if base_output_dir is None:
@@ -70,6 +71,7 @@ def eval_task(
     }
     cfg["task"]["env_runner"]["_target_"] = SEEDED_RUNNER_TARGET
     cfg["task"]["env_runner"]["test_start_seed"] = start_seed
+    cfg["task"]["env_runner"]["policy_start_seed"] = policy_start_seed
     cfg = OmegaConf.create(cfg)
 
     horizon = get_task_horizon(task=task)
@@ -140,9 +142,10 @@ def main():
     parser.add_argument('-d', '--device', default='cuda:0')
     parser.add_argument('-t', '--task_set', required=True, nargs='+')
     parser.add_argument('-n', '--num_rollouts', default=30, type=int)
-    parser.add_argument('-e', '--num_envs', default=5, type=int)
+    parser.add_argument('-e', '--num_envs', default=1, type=int)
     parser.add_argument('-s', '--split', required=True)
     parser.add_argument('--start_seed', default=1111111, type=int)
+    parser.add_argument('--policy_start_seed', default=42, type=int)
     args = parser.parse_args()
 
     all_tasks = []
@@ -161,6 +164,7 @@ def main():
             args.num_envs,
             args.split,
             args.start_seed,
+            args.policy_start_seed,
             overwrite=False,
         )
 

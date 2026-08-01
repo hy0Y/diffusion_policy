@@ -1,4 +1,5 @@
 import os
+import random
 import wandb
 import numpy as np
 import torch
@@ -73,12 +74,18 @@ class SeededRobomimicImageRunner(BaseImageRunner):
             abs_action=False,
             tqdm_interval_sec=5.0,
             n_envs=None,
+            policy_start_seed=42,
             env_kwargs=None
         ):
         super().__init__(output_dir)
 
         if n_envs is None:
             n_envs = n_train + n_test
+        if n_envs != 1:
+            raise ValueError(
+                "The P1 canonical evaluator requires n_envs=1 so each trial "
+                "has an explicit, independently reset policy RNG stream."
+            )
 
         # assert n_obs_steps <= n_action_steps
         robosuite_fps = 20
@@ -208,6 +215,7 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         self.env = env
         self.env_fns = env_fns
         self.env_seeds = env_seeds
+        self.policy_seeds = [policy_start_seed + i for i in range(n_test)]
         self.env_prefixs = env_prefixs
         self.env_init_fn_dills = env_init_fn_dills
         self.fps = fps
@@ -254,6 +262,16 @@ class SeededRobomimicImageRunner(BaseImageRunner):
             # start rollout
             obs = env.reset()
             past_action = None
+
+            # With canonical n_envs=1, one policy RNG seed maps to exactly one
+            # online trial. This controls diffusion denoising noise separately
+            # from the environment seed used above.
+            policy_seed = self.policy_seeds[start]
+            random.seed(policy_seed)
+            np.random.seed(policy_seed)
+            torch.manual_seed(policy_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(policy_seed)
             policy.reset()
 
             env_name = self.env_kwargs['env_name']
@@ -320,6 +338,8 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         max_rewards = collections.defaultdict(list)
         log_data = dict()
         log_data['evaluation/environment_seeds'] = list(self.env_seeds)
+        log_data['evaluation/policy_seeds'] = list(self.policy_seeds)
+        log_data['evaluation/n_envs'] = n_envs
         log_data['evaluation/explicit_seed_reset'] = True
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
