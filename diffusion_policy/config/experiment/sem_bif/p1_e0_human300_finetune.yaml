@@ -1,0 +1,10 @@
+# @package _global_
+experiment:
+  name: p1_e0_human300_finetune
+
+policy:
+  semantic_enabled: false
+  direct_boundary_enabled: false
+  bifurcation_enabled: false
+  train_diffusion: true
+  freeze_transformer: false

@@ -1,0 +1,130 @@
+defaults:
+  - _self_
+  - task: robocasa/p1_e0_target_composite_seen
+  - experiment: sem_bif/p1_e0_human300_finetune
+
+name: train_p1_e0_human300_target_composite_seen
+_target_: diffusion_policy.workspace.train_semantic_diffusion_transformer_hybrid_workspace.TrainSemanticDiffusionTransformerHybridWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: p1_e0_human300_target_finetune_control
+
+horizon: 10
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: false
+obs_as_cond: true
+
+policy:
+  _target_: diffusion_policy.policy.semantic_diffusion_transformer_hybrid_image_policy.SemanticDiffusionTransformerHybridImagePolicy
+  shape_meta: ${shape_meta}
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+  horizon: ${horizon}
+  n_action_steps: ${eval:"${n_action_steps}+${n_latency_steps}"}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  crop_shape: [224, 224]
+  obs_encoder_group_norm: true
+  eval_fixed_crop: true
+  n_layer: 12
+  n_cond_layers: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.0
+  p_drop_attn: 0.3
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: ${obs_as_cond}
+  num_subtask_classes: ${task.semantic_metadata.num_subtask_classes}
+  num_semantic_skill_classes: ${task.semantic_metadata.num_semantic_skill_classes}
+  num_stage_classes: ${task.semantic_metadata.num_stage_classes}
+  semantic_enabled: false
+  direct_boundary_enabled: false
+  bifurcation_enabled: false
+  train_diffusion: true
+  freeze_transformer: false
+  lambda_sem: 0.1
+  lambda_bound: 0.1
+  probing_timesteps: [80, 70, 60, 50, 40, 30, 20]
+  m_train: 4
+  m_eval: 16
+  bifurcation_temperature: 0.1
+  probe_batch_size_per_device: 2
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 192
+  num_workers: 32
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 192
+  num_workers: 16
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+
+optimizer:
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 0.0
+  base_learning_rate: 1.0e-4
+  aux_learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
+
+training:
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  aux_warmup_steps: 1000
+  total_optimizer_steps: 100000
+  validation_every_steps: 5000
+  checkpoint_every_steps: 5000
+  bifurcation_every_steps: 10
+  compensate_bifurcation_frequency: true
+  max_val_steps: null
+  max_bifurcation_val_batches: 10
+  max_grad_norm: 1.0
+  use_ema: true
+
+logging:
+  project: sem_bif_p1
+  resume: false
+  mode: offline
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${task_name}_${experiment.name}_human300
+  tags: ["${task_name}", "${experiment.name}", "${training.seed}"]
+  id: null
+  group: p1_e0_human300_target_finetune
+
+run_root: /data/sem_bif/runs/p1/p1_e0_human300_target_composite
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${task_name}_${experiment.name}
+  run:
+    dir: ${run_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_${task_name}_${experiment.name}_seed${training.seed}
