@@ -7,6 +7,7 @@ if __name__ == "__main__":
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 
+import json
 import copy
 from datetime import timedelta
 import math
@@ -267,6 +268,109 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         finally:
             self.model = wrapped_model
 
+    @staticmethod
+    def _platform_signal_writer():
+        if not os.environ.get("SEM_BIF_RUN_DIR"):
+            return None
+        from sem_bif_experiment_runtime import SignalWriter
+        return SignalWriter.from_environment()
+
+    def _publish_platform_metrics(
+            self,
+            metrics: dict[str, float],
+            *,
+            training_step: int,
+            epoch: float,
+        ) -> None:
+        writer = self._platform_signal_writer()
+        if writer is None:
+            return
+        definitions = writer.definitions()
+        for source_key, value in metrics.items():
+            signal_id = source_key.split("/", maxsplit=1)[-1]
+            definition = definitions.get(signal_id)
+            if definition is None or definition.signal_type != "metric":
+                continue
+            writer.metric(
+                signal_id,
+                value,
+                training_step,
+                epoch=epoch,
+                context={"source_key": source_key},
+            )
+
+    def _register_platform_checkpoint(
+            self,
+            path: str | pathlib.Path,
+            *,
+            aliases: list[str],
+            metrics: dict[str, float],
+            checkpoint_id: str | None = None,
+        ) -> None:
+        if not os.environ.get("SEM_BIF_RUN_DIR"):
+            return
+        from sem_bif_experiment_runtime import CheckpointRegistry
+        registry = CheckpointRegistry.from_environment()
+        resolved_id = checkpoint_id or f"step_{self.global_step:08d}"
+        registry.register(
+            pathlib.Path(path),
+            resolved_id,
+            self.global_step,
+            aliases=aliases,
+            metrics=metrics,
+            metadata={
+                "p1_mode": self.cfg.policy.p1_mode,
+            },
+        )
+
+    @staticmethod
+    def _platform_probe_row(
+            row: dict[str, float | int]) -> dict[str, float | int]:
+        payload = dict(row)
+        payload.setdefault("value", payload["probability"])
+        return payload
+
+    def _publish_platform_probe(
+            self,
+            rows: list[dict[str, float | int]],
+        ) -> None:
+        writer = self._platform_signal_writer()
+        if writer is None or not rows:
+            return
+        definition = writer.definitions().get("boundary_probability_trace")
+        if definition is None or definition.signal_type != "probe":
+            return
+        artifact_dir = pathlib.Path(self.output_dir) / "platform_probes"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        source = artifact_dir / (
+            f"boundary_probability_step_{self.global_step:08d}.jsonl")
+        ordered = sorted(
+            rows,
+            key=lambda row: (row["episode_id"], row["physical_time"]),
+        )
+        with source.open("w", encoding="utf-8") as handle:
+            for row in ordered:
+                payload = self._platform_probe_row(row)
+                handle.write(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    + "\n")
+        writer.publish_probe(
+            "boundary_probability_trace",
+            source,
+            f"boundary_probability_step_{self.global_step:08d}",
+            self.global_step,
+            rows=len(ordered),
+            scope={
+                "p1_mode": self.cfg.policy.p1_mode,
+                "validation_seed": int(self.cfg.validation.seed),
+            },
+            artifact_format="jsonl",
+            content_type="application/x-ndjson",
+        )
+
+
+
+
     def _validation(
             self,
             *,
@@ -275,12 +379,13 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             dataset,
             sampler: EpisodeBundleSampler,
             cfg: OmegaConf,
-        ) -> dict[str, float]:
+        ) -> tuple[dict[str, float], list[dict[str, float | int]]]:
         schedule = sampler.sample_epoch(epoch=0)
         rank_schedule = self._rank_schedule(
             schedule, accelerator, cfg.sampling.episodes_per_rank)
         loader = self._loader(dataset, rank_schedule, cfg.val_dataloader)
         totals: dict[str, float] = {}
+        local_probe_rows: list[dict[str, float | int]] = []
         count = 0.0
         policy.eval()
         with torch.no_grad():
@@ -293,6 +398,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                     accelerator.process_index))
                 batch = _to_device(batch, accelerator.device)
                 policy.compute_loss(batch)
+                local_probe_rows.extend(policy.last_probe_rows)
                 real_groups = float(batch["episode_valid"].sum().item())
                 for key, value in policy.last_loss_metrics.items():
                     if not key.endswith("_count"):
@@ -307,10 +413,24 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         packed = accelerator.reduce(packed, reduction="sum")
         keys = sorted(totals)
         global_count = max(int(packed[0].item()), 1)
-        return {
+        metrics = {
             f"val/{key}": float(packed[index + 1].item() / global_count)
             for index, key in enumerate(keys)
         }
+        if accelerator.num_processes > 1:
+            gathered: list[list[dict[str, float | int]]] = [
+                [] for _ in range(accelerator.num_processes)
+            ]
+            torch.distributed.all_gather_object(
+                gathered, local_probe_rows)
+            probe_rows = [
+                row
+                for rank_rows in gathered
+                for row in rank_rows
+            ]
+        else:
+            probe_rows = local_probe_rows
+        return metrics, probe_rows
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -447,6 +567,34 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         log_path = os.path.join(self.output_dir, "logs.json.txt")
         self.optimizer.zero_grad()
 
+        if bool(cfg.training.get("validation_only", False)):
+            with JsonLogger(log_path) as json_logger:
+                validation_policy = accelerator.unwrap_model(self.model)
+                if self.ema_model is not None:
+                    validation_policy = self.ema_model
+                validation_metrics, probe_rows = self._validation(
+                    accelerator=accelerator,
+                    policy=validation_policy,
+                    dataset=validation_dataset,
+                    sampler=validation_sampler,
+                    cfg=cfg,
+                )
+                accelerator.log(validation_metrics, step=self.global_step)
+                if accelerator.is_main_process:
+                    json_logger.log({
+                        **validation_metrics,
+                        "epoch": self.epoch,
+                        "global_step": self.global_step,
+                    })
+                    self._publish_platform_metrics(
+                        validation_metrics,
+                        training_step=self.global_step,
+                        epoch=float(self.epoch),
+                    )
+                    self._publish_platform_probe(probe_rows)
+            accelerator.end_training()
+            return
+
         with JsonLogger(log_path) as json_logger:
             stop_after_step = False
             while self.epoch < cfg.training.num_epochs:
@@ -538,15 +686,31 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                     accelerator.log(metrics, step=self.global_step)
                     if accelerator.is_main_process:
                         json_logger.log(metrics)
+                        self._publish_platform_metrics(
+                            metrics,
+                            training_step=self.global_step,
+                            epoch=float(self.epoch),
+                        )
                     iterator.set_postfix(loss=float(loss.detach()))
 
+                    max_train_steps = cfg.training.get("max_train_steps")
                     if cfg.training.checkpoint_every_steps is not None \
                             and self.global_step % cfg.training.checkpoint_every_steps == 0:
                         if accelerator.is_main_process:
-                            self._save_training_checkpoint(accelerator)
+                            checkpoint_path = self._save_training_checkpoint(accelerator)
+                            aliases = (
+                                ["last"]
+                                if max_train_steps is not None
+                                and self.global_step >= int(max_train_steps)
+                                else []
+                            )
+                            self._register_platform_checkpoint(
+                                checkpoint_path,
+                                aliases=aliases,
+                                metrics=reduced,
+                            )
                         accelerator.wait_for_everyone()
 
-                    max_train_steps = cfg.training.get("max_train_steps")
                     if max_train_steps is not None \
                             and self.global_step >= int(max_train_steps):
                         stop_after_step = True
@@ -562,13 +726,14 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                     validation_policy = accelerator.unwrap_model(self.model)
                     if self.ema_model is not None:
                         validation_policy = self.ema_model
-                    epoch_metrics.update(self._validation(
+                    validation_metrics, probe_rows = self._validation(
                         accelerator=accelerator,
                         policy=validation_policy,
                         dataset=validation_dataset,
                         sampler=validation_sampler,
                         cfg=cfg,
-                    ))
+                    )
+                    epoch_metrics.update(validation_metrics)
                     accelerator.log(epoch_metrics, step=self.global_step)
                     if accelerator.is_main_process:
                         json_logger.log({
@@ -576,10 +741,22 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                             "epoch": self.epoch,
                             "global_step": self.global_step,
                         })
+                        self._publish_platform_metrics(
+                            validation_metrics,
+                            training_step=self.global_step,
+                            epoch=float(self.epoch),
+                        )
+                        self._publish_platform_probe(probe_rows)
 
                 if self.epoch % cfg.training.checkpoint_every == 0:
                     if accelerator.is_main_process:
-                        self._save_training_checkpoint(accelerator)
+                        checkpoint_path = self._save_training_checkpoint(accelerator)
+                        aliases = ["last"] if self.epoch >= cfg.training.num_epochs else []
+                        self._register_platform_checkpoint(
+                            checkpoint_path,
+                            aliases=aliases,
+                            metrics=epoch_metrics,
+                        )
                         if "val/loss_total" in epoch_metrics:
                             path = topk.get_ckpt_path({
                                 "epoch": self.epoch,

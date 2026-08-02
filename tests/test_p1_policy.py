@@ -44,6 +44,7 @@ def make_policy(mode: str):
         p1_group_stride=3,
     )
     policy.normalizer["action"] = SingleFieldLinearNormalizer.create_identity()
+    policy.normalizer["state"] = SingleFieldLinearNormalizer.create_identity()
     return policy
 
 
@@ -130,6 +131,15 @@ def test_oracle_freezes_backbone_and_trains_only_p1_path():
         assert torch.isfinite(torch.tensor(policy.last_loss_metrics[key]))
 
 
+def test_oracle_eval_uses_predicted_gate_without_future_boundary():
+    policy = make_policy("oracle_gate_symbol")
+    policy.eval()
+    _, details = policy.compute_group_loss(make_batch())
+
+    assert details is not None
+    assert policy.last_loss_metrics["rho"] == 0.0
+
+
 def test_main_schedule_reaches_predicted_gate():
     policy = make_policy("main")
     assert all(
@@ -154,3 +164,27 @@ def test_all_dummy_rank_has_finite_zero_weight_probes():
     assert loss.item() == 0.0
     for value in policy.last_loss_metrics.values():
         assert torch.isfinite(torch.tensor(value))
+
+
+def test_latent_modes_online_inference_persist_physical_frame_history():
+    for mode in ("oracle_gate_symbol", "main"):
+        policy = make_policy(mode)
+        policy.eval()
+        policy.n_action_steps = 1
+        policy.num_inference_steps = 2
+        first = policy.predict_action({
+            "state": torch.randn(1, 2, 5),
+        })
+        second = policy.predict_action({
+            "state": torch.randn(1, 2, 5),
+            "past_action": first["action"][:, -1:],
+        })
+
+        assert first["action"].shape == (1, 1, 3)
+        assert second["action"].shape == (1, 1, 3)
+        assert policy._p1_online_history_feature.shape[1] == 2
+        assert len(policy.last_online_probe["probability"]) == policy.horizon - 1
+        assert all(
+            0 <= value <= 1
+            for value in policy.last_online_probe["probability"]
+        )

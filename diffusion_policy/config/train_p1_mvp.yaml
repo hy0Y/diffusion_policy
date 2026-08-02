@@ -65,6 +65,7 @@ policy:
   p1_beta_overlap_max: 0.05
   p1_teacher_force_until: 0.40
   p1_teacher_force_end: 0.60
+  p1_online_episode_length: 600
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -112,6 +113,7 @@ training:
   use_ema: true
   val_every: 5
   checkpoint_every: 5
+  validation_only: false
   checkpoint_every_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0

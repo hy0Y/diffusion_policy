@@ -124,3 +124,17 @@ def test_ddp_loss_scale_recovers_real_group_weighted_mean():
         rank0_scale * rank0_mean + rank1_scale * rank1_mean) / 2
     expected = (32 * rank0_mean + 16 * rank1_mean) / 48
     torch.testing.assert_close(ddp_gradient_equivalent, expected)
+
+
+def test_platform_probe_row_exposes_canonical_value_without_mutation():
+    source = {
+        "episode_id": 4,
+        "physical_time": 19,
+        "probability": 0.35,
+        "intensity": 1.2,
+        "target": 0.0,
+    }
+    payload = TrainP1MVPWorkspace._platform_probe_row(source)
+
+    assert payload["value"] == 0.35
+    assert "value" not in source
