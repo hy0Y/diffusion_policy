@@ -14,7 +14,7 @@ import math
 import os
 import pathlib
 import random
-from typing import Any
+from typing import Any, Literal
 
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs
@@ -279,6 +279,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             self,
             metrics: dict[str, float],
             *,
+            stage: Literal["train", "validation"],
             training_step: int,
             epoch: float,
         ) -> None:
@@ -295,6 +296,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                 signal_id,
                 value,
                 training_step,
+                stage=stage,
                 epoch=epoch,
                 context={"source_key": source_key},
             )
@@ -333,6 +335,8 @@ class TrainP1MVPWorkspace(BaseWorkspace):
     def _publish_platform_probe(
             self,
             rows: list[dict[str, float | int]],
+            *,
+            stage: Literal["validation"],
         ) -> None:
         writer = self._platform_signal_writer()
         if writer is None or not rows:
@@ -359,6 +363,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             source,
             f"boundary_probability_step_{self.global_step:08d}",
             self.global_step,
+            stage=stage,
             rows=len(ordered),
             scope={
                 "p1_mode": self.cfg.policy.p1_mode,
@@ -588,10 +593,12 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                     })
                     self._publish_platform_metrics(
                         validation_metrics,
+                        stage="validation",
                         training_step=self.global_step,
                         epoch=float(self.epoch),
                     )
-                    self._publish_platform_probe(probe_rows)
+                    self._publish_platform_probe(
+                        probe_rows, stage="validation")
             accelerator.end_training()
             return
 
@@ -688,6 +695,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                         json_logger.log(metrics)
                         self._publish_platform_metrics(
                             metrics,
+                            stage="train",
                             training_step=self.global_step,
                             epoch=float(self.epoch),
                         )
@@ -743,10 +751,12 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                         })
                         self._publish_platform_metrics(
                             validation_metrics,
+                            stage="validation",
                             training_step=self.global_step,
                             epoch=float(self.epoch),
                         )
-                        self._publish_platform_probe(probe_rows)
+                        self._publish_platform_probe(
+                            probe_rows, stage="validation")
 
                 if self.epoch % cfg.training.checkpoint_every == 0:
                     if accelerator.is_main_process:

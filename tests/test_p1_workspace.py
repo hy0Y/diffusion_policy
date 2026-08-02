@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 import torch
@@ -79,6 +80,25 @@ class UnwrappedAccelerator:
         return model
 
 
+class CapturingSignalWriter:
+    def __init__(self):
+        self.metric_calls = []
+        self.probe_calls = []
+
+    @staticmethod
+    def definitions():
+        return {
+            "loss_total": SimpleNamespace(signal_type="metric"),
+            "boundary_probability_trace": SimpleNamespace(signal_type="probe"),
+        }
+
+    def metric(self, *args, **kwargs):
+        self.metric_calls.append((args, kwargs))
+
+    def publish_probe(self, *args, **kwargs):
+        self.probe_calls.append((args, kwargs))
+
+
 def test_workspace_checkpoint_restores_mid_epoch_and_ema_state(tmp_path):
     source = prepare_checkpointable_workspace(tmp_path)
     source.global_step = 13
@@ -138,3 +158,59 @@ def test_platform_probe_row_exposes_canonical_value_without_mutation():
 
     assert payload["value"] == 0.35
     assert "value" not in source
+
+
+def test_platform_validation_outputs_override_outer_train_stage(
+        tmp_path, monkeypatch):
+    writer = CapturingSignalWriter()
+    monkeypatch.setattr(
+        TrainP1MVPWorkspace,
+        "_platform_signal_writer",
+        staticmethod(lambda: writer),
+    )
+    workspace = TrainP1MVPWorkspace.__new__(TrainP1MVPWorkspace)
+    workspace._output_dir = str(tmp_path)
+    workspace.global_step = 125
+    workspace.cfg = SimpleNamespace(
+        policy=SimpleNamespace(p1_mode="oracle_gate_symbol"),
+        validation=SimpleNamespace(seed=43),
+    )
+
+    workspace._publish_platform_metrics(
+        {"val/loss_total": 0.5},
+        stage="validation",
+        training_step=125,
+        epoch=5.0,
+    )
+    workspace._publish_platform_probe(
+        [{
+            "episode_id": 4,
+            "physical_time": 19,
+            "probability": 0.35,
+            "intensity": 1.2,
+            "target": 0.0,
+        }],
+        stage="validation",
+    )
+
+    assert writer.metric_calls[0][1]["stage"] == "validation"
+    assert writer.probe_calls[0][1]["stage"] == "validation"
+
+
+def test_platform_training_metrics_are_explicitly_labeled_train(monkeypatch):
+    writer = CapturingSignalWriter()
+    monkeypatch.setattr(
+        TrainP1MVPWorkspace,
+        "_platform_signal_writer",
+        staticmethod(lambda: writer),
+    )
+    workspace = TrainP1MVPWorkspace.__new__(TrainP1MVPWorkspace)
+
+    workspace._publish_platform_metrics(
+        {"train/loss_total": 0.75},
+        stage="train",
+        training_step=1,
+        epoch=0.0,
+    )
+
+    assert writer.metric_calls[0][1]["stage"] == "train"
