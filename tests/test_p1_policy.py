@@ -177,6 +177,43 @@ def test_all_dummy_rank_has_finite_zero_weight_probes():
         assert torch.isfinite(torch.tensor(value))
 
 
+
+def test_sequential_episode_probe_commits_latent_across_every_edge():
+    policy = make_policy("main")
+    policy.eval()
+    episode_length = 5
+    generator = torch.Generator().manual_seed(311)
+    calls = []
+    original_forward = policy.p1_model.dynamics.forward
+
+    def recording_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        assert output.probability.shape[1] == 1
+        calls.append((
+            kwargs["initial_z"].detach().clone(),
+            output.z[:, 1].detach().clone(),
+        ))
+        return output
+
+    policy.p1_model.dynamics.forward = recording_forward
+    rows = policy.compute_sequential_episode_probe(
+        feature=torch.randn(episode_length, 5, generator=generator),
+        action_candidate=torch.randn(
+            episode_length - 1, policy.horizon, 3, generator=generator),
+        previous_action=torch.randn(episode_length, 3, generator=generator),
+        subtask_idx=torch.zeros(episode_length, dtype=torch.long),
+        boundary_target=torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]),
+        diffusion_timestep=7,
+        noise=torch.randn(
+            episode_length - 1, policy.horizon, 3, generator=generator),
+    )
+
+    assert [row["physical_time"] for row in rows] == [1, 2, 3, 4]
+    assert [row["target"] for row in rows] == [1.0, 0.0, 1.0, 0.0]
+    assert len(calls) == episode_length - 1
+    for previous, current in zip(calls, calls[1:]):
+        torch.testing.assert_close(current[0], previous[1])
+
 def test_latent_modes_online_inference_persist_physical_frame_history():
     for mode in ("oracle_gate_symbol", "main"):
         policy = make_policy(mode)

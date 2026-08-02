@@ -66,6 +66,8 @@ policy:
   p1_teacher_force_until: 0.40
   p1_teacher_force_end: 0.60
   p1_online_episode_length: 600
+  # Cached-feature Baseline is DiT-only; no raw observation reaches the encoder.
+  p1_train_obs_encoder: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -106,17 +108,16 @@ validation:
   probe_timesteps:
     - {name: clean, index: 19}
     - {name: noisy, index: 78}
-  probe_groups_per_batch: 4
   probe_every_epochs: 10
 
 training:
   seed: 42
   debug: false
   resume: false
-  num_epochs: 100
+  num_epochs: 50
   gradient_accumulate_every: 1
   lr_scheduler: cosine
-  lr_warmup_steps: 250
+  lr_warmup_steps: 125
   max_train_steps: null
   max_grad_norm: 1.0
   use_ema: true

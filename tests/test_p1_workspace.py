@@ -6,10 +6,6 @@ import torch
 
 from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
 from diffusion_policy.workspace.train_p1_mvp_workspace import TrainP1MVPWorkspace
-from diffusion_policy.workspace.train_p1_mvp_workspace import (
-    full_episode_group_starts,
-    stitch_full_episode_probe_rows,
-)
 
 
 def workspace_config():
@@ -223,47 +219,3 @@ def test_platform_training_metrics_are_explicitly_labeled_train(monkeypatch):
     )
 
     assert writer.metric_calls[0][1]["stage"] == "train"
-
-
-def test_full_episode_group_starts_cover_every_endpoint():
-    starts = full_episode_group_starts(50)
-
-    assert starts == (0, 24, 25)
-    covered = {
-        endpoint
-        for start in starts
-        for endpoint in range(start + 1, start + 25)
-    }
-    assert covered == set(range(1, 50))
-
-
-def test_stitch_full_episode_probe_rows_aggregates_overlap_views():
-    rows = []
-    for endpoint in range(1, 26):
-        rows.append({
-            "episode_id": 4,
-            "physical_time": endpoint,
-            "probability": endpoint / 100,
-            "intensity": endpoint / 10,
-            "target": float(endpoint == 9),
-            "tau_name": "clean",
-            "tau_index": 19,
-        })
-    rows.append({
-        "episode_id": 4,
-        "physical_time": 25,
-        "probability": 0.35,
-        "intensity": 3.5,
-        "target": 0.0,
-        "tau_name": "clean",
-        "tau_index": 19,
-    })
-
-    stitched = stitch_full_episode_probe_rows(
-        rows, episode_lengths={4: 26})
-
-    endpoint = next(row for row in stitched if row["physical_time"] == 25)
-    assert endpoint["p_mean"] == 0.3
-    assert abs(endpoint["p_std"] - 0.05) < 1e-12
-    assert endpoint["p_count"] == 2
-    assert [row["physical_time"] for row in stitched] == list(range(1, 26))

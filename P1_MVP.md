@@ -5,12 +5,11 @@
 
 | Experiment name | Config | 학습 대상 | Privileged input / gate |
 |---|---|---|---|
-| `P1-Baseline-DiT-Unfreeze` | `train_p1_baseline` | observation encoder + 기존 DiT 전체 | 없음 |
+| `P1-Baseline-DiT-Unfreeze` | `train_p1_baseline` | cached feature 조건의 기존 DiT만 | 없음 |
 | `P1-Oracle-Gate-Symbol-DiT-Freeze` | `train_p1_oracle_gate_symbol` | P1 history/Flow/Jump/feedback만 | GT gate + window-start current symbol |
 | `P1-Main-Full-DiT-Freeze` | `train_p1_main_full` | P1 history/Flow/Jump/feedback만 | train GT→predicted soft gate; eval predicted gate |
 
-세 실험 모두 raw RGB/proprioception/language를 읽는다. Oracle/Main의 pretrained
-observation encoder와 DiT는 parameter뿐 아니라 train/eval mode도 freeze한다. 같은
+세 실험 모두 locked 969-D observation-feature cache와 cached action window를 읽는다. Baseline은 observation encoder를 freeze하고 DiT만 fine-tune하며, Oracle/Main은 observation encoder와 DiT를 모두 freeze한다. 같은
 physical time의 overlap action에는 같은 Gaussian noise를 쓰고, 한 group의 네
 window는 같은 diffusion timestep을 쓴다.
 
@@ -84,7 +83,7 @@ memory. The full 450-episode epoch audit yields 3,600 groups and 14,400 windows.
 | Epoch | 25 optimizer steps; 450 real episodes, dummy 없음 |
 | Train / validation workers | rank당 4 / 2 |
 | Gradient accumulation | 1 |
-| LR / warmup | `1e-4` / 250 steps (100-epoch 2,500-step budget의 10%) |
+| LR / warmup | `1e-4` / 125 steps (50-epoch 1,250-step budget의 10%) |
 | Validation / checkpoint | 5 epoch마다 |
 
 가장 무거운 Baseline의 single-GPU 실제 profile에서 3 episodes/rank는 peak reserved
@@ -95,14 +94,11 @@ allocator fragmentation과 운영 여유를 고려하면 안전한 full-run 값�
 
 | 실험 | Trainable parameters | Breakdown |
 |---|---:|---|
-| P1-Baseline-DiT-Unfreeze | 106,025,196 | observation encoder 42,450,144 + DiT 63,575,052 |
+| P1-Baseline-DiT-Unfreeze | 63,575,052 | DiT 63,575,052 (observation encoder frozen) |
 | P1-Oracle-Gate-Symbol-DiT-Freeze | 1,858,465 | history 367,584 + dynamics 1,350,849 + feedback 140,032 |
 | P1-Main-Full-DiT-Freeze | 1,858,273 | history 367,392 + dynamics 1,350,849 + feedback 140,032 |
 
-Baseline은 raw image를 읽어서 무거운 것이 아니라 observation encoder와 DiT 전체를
-학습하기 때문에 가장 많은 메모리를 쓴다. Autograd가 backbone activation과 gradient를
-보존하고 AdamW state도 1.06억 parameter에 대해 유지한다. Oracle/Main도 같은 raw
-input을 읽지만 frozen backbone은 `no_grad`로 실행하고 약 186만 P1 parameter만 학습한다.
+Baseline은 cached feature를 조건으로 DiT만 학습한다. Observation encoder에는 raw image가 입력되지 않으며 freeze된다. Oracle/Main도 같은 cache를 읽고 frozen DiT는 `no_grad`로 실행하며 약 186만 P1 parameter만 학습한다.
 위 수는 각 production config로 실제 policy를 생성한 뒤 `requires_grad=True`인
 parameter의 `numel()`을 합산한 값이다. Oracle과 Main의 192개 차이는
 `6 symbols × 32 dimensions`인 oracle embedding이며 Main에서는 freeze된다.

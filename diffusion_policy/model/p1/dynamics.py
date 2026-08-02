@@ -180,8 +180,9 @@ class LatentDynamics(nn.Module):
         oracle: Tensor | None = None,
         boundary_target: Tensor | None = None,
         teacher_ratio: float | Tensor = 0.0,
+        max_edges: int | None = None,
     ) -> DynamicsOutput:
-        """Scan W-1 edges while storing W right-continuous latent states."""
+        """Scan all edges by default, or a strict prefix for sequential inference."""
         _, window, oracle, tau, ratio = self._validate_inputs(
             initial_z=initial_z,
             hidden=hidden,
@@ -192,6 +193,9 @@ class LatentDynamics(nn.Module):
             boundary_target=boundary_target,
             teacher_ratio=teacher_ratio,
         )
+        edge_count = window - 1 if max_edges is None else int(max_edges)
+        if not 1 <= edge_count <= window - 1:
+            raise ValueError("max_edges must lie in [1,W-1]")
         cfg = self.config
         current = initial_z
         stored = [current]
@@ -204,7 +208,7 @@ class LatentDynamics(nn.Module):
         flow_condition_values: list[Tensor] = []
         jump_condition_values: list[Tensor] = []
 
-        for edge in range(window - 1):
+        for edge in range(edge_count):
             projector_input = torch.cat(
                 (
                     hidden[:, edge],

@@ -49,9 +49,9 @@ expected_validation_episodes: 25
 # P1_MVP_CANDIDATE_ARTIFACT may point at the locked train NPZ for parity runs.
 train_candidate_artifact: ${oc.env:P1_MVP_CANDIDATE_ARTIFACT,null}
 
-# raw is mandatory for the reported Baseline and is the default for all runs.
-# cached is a parity/profile path for the frozen-backbone experiments only.
-input_path: raw
+# All three 50-epoch pilots consume the locked 969-D observation-feature cache.
+# Baseline therefore fine-tunes DiT only; its observation encoder stays frozen.
+input_path: cached
 history_feature_variant: 0
 
 base_dataset:

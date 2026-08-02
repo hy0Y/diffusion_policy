@@ -1,8 +1,7 @@
 """Runtime data contract for the GetToastedBread P1 MVP.
 
-The primary experiment will read raw observations. This cached-feature dataset is
-kept as a contract/parity/profile path and deliberately requires artifact paths to
-be supplied by the experiment config.
+The production 50-epoch pilots read locked cached observation features. The raw
+wrapper remains available for parity checks and explicitly configured ablations.
 """
 
 from __future__ import annotations
@@ -197,6 +196,37 @@ class CachedEpisodeStore:
             prefix_length=frame_count,
             episode_length=frame_count,
         )
+
+    def load_sequential_episode(
+            self, episode_id: int, *, feature_variant: int
+        ) -> dict[str, np.ndarray | int]:
+        """Load one episode for a strictly forward, one-edge-at-a-time probe."""
+        annotation_path, feature_path, action_path = self._paths(episode_id)
+        features = np.load(feature_path, mmap_mode="r", allow_pickle=False)
+        actions = np.load(action_path, mmap_mode="r", allow_pickle=False)
+        frame_count = int(features.shape[0])
+        if features.shape != (frame_count, 5, 969):
+            raise ValueError("invalid sequential-probe feature cache shape")
+        if actions.shape != (frame_count, GROUP_WINDOW, 12):
+            raise ValueError("invalid sequential-probe action cache shape")
+        annotation = pq.read_table(
+            annotation_path, columns=["boundary_any_hard", "subtask_idx"]
+        ).to_pydict()
+        boundary = np.asarray(annotation["boundary_any_hard"], dtype=np.float32)
+        subtask = np.asarray(annotation["subtask_idx"], dtype=np.int64)
+        if len(boundary) != frame_count or len(subtask) != frame_count:
+            raise ValueError("annotation/cache frame counts do not match")
+        history = self._load_history_episode(episode_id, feature_variant)
+        return {
+            "episode_id": episode_id,
+            "episode_length": frame_count,
+            "feature": np.asarray(features[:, feature_variant]).copy(),
+            # Row r=t+1 is the cached candidate window beginning at action t.
+            "action_candidate": np.asarray(actions[1:]).copy(),
+            "previous_action": history.previous_action.copy(),
+            "subtask_idx": subtask.copy(),
+            "boundary_target": boundary.copy(),
+        }
 
     def load_history(
             self,

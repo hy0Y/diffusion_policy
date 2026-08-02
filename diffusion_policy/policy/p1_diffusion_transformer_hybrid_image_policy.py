@@ -33,8 +33,9 @@ class P1DiffusionTransformerHybridImagePolicy(
         DiffusionTransformerHybridImagePolicy):
     """One policy class with an audited experiment-mode boundary.
 
-    ``baseline`` fine-tunes the original observation encoder and DiT on the P1
-    group sampler. ``oracle_gate_symbol`` and ``main`` freeze those modules and
+    ``baseline`` fine-tunes DiT and optionally the observation encoder. The
+    production cached-feature config freezes the observation encoder. ``oracle_gate_symbol`` and ``main`` freeze both
+    backbone modules and
     train only the P1 latent path. Oracle receives causal past/current symbols
     and uses GT boundaries only as a training-time Jump teacher. Evaluation and
     online inference use predicted soft gates. Main receives no symbol and
@@ -65,6 +66,7 @@ class P1DiffusionTransformerHybridImagePolicy(
             p1_teacher_force_until: float = 0.40,
             p1_teacher_force_end: float = 0.60,
             p1_online_episode_length: int = 600,
+            p1_train_obs_encoder: bool = True,
             **kwargs,
         ):
         super().__init__(*args, **kwargs)
@@ -76,6 +78,7 @@ class P1DiffusionTransformerHybridImagePolicy(
         self.p1_teacher_force_until = float(p1_teacher_force_until)
         self.p1_teacher_force_end = float(p1_teacher_force_end)
         self.p1_online_episode_length = int(p1_online_episode_length)
+        self.p1_train_obs_encoder = bool(p1_train_obs_encoder)
         if self.p1_online_episode_length < 2:
             raise ValueError("p1_online_episode_length must be at least 2")
 
@@ -92,6 +95,11 @@ class P1DiffusionTransformerHybridImagePolicy(
             raise ValueError("p1_split_layer must lie inside the DiT decoder")
 
         self.p1_model: P1LatentGroupModel | None = None
+        if (
+            self.p1_mode is P1ExperimentMode.BASELINE
+            and not self.p1_train_obs_encoder
+        ):
+            self.obs_encoder.requires_grad_(False)
         if self.p1_mode is not P1ExperimentMode.BASELINE:
             dynamics_config = P1DynamicsConfig(
                 latent_dim=p1_latent_dim,
@@ -556,6 +564,100 @@ class P1DiffusionTransformerHybridImagePolicy(
             )
         ]
         return losses.total, losses
+
+    def compute_sequential_episode_probe(
+            self,
+            *,
+            feature: Tensor,
+            action_candidate: Tensor,
+            previous_action: Tensor,
+            subtask_idx: Tensor,
+            boundary_target: Tensor,
+            diffusion_timestep: int,
+            noise: Tensor,
+        ) -> list[dict[str, float | int]]:
+        """Scan one episode forward and commit exactly one physical edge per step."""
+        if self.p1_model is None or self.p1_mode is P1ExperimentMode.BASELINE:
+            return []
+        if feature.ndim != 2 or feature.shape[-1] != self.obs_feature_dim:
+            raise ValueError("feature must have shape [T,obs_feature_dim]")
+        episode_length = feature.shape[0]
+        expected_actions = (episode_length - 1, self.horizon, self.action_dim)
+        if action_candidate.shape != expected_actions or noise.shape != expected_actions:
+            raise ValueError("action_candidate/noise shape does not match episode scan")
+        if previous_action.shape != (episode_length, self.action_dim):
+            raise ValueError("previous_action must have shape [T,action_dim]")
+        if subtask_idx.shape != (episode_length,):
+            raise ValueError("subtask_idx must have shape [T]")
+        if boundary_target.shape != (episode_length,):
+            raise ValueError("boundary_target must have shape [T]")
+
+        valid = torch.ones((1, 1), device=feature.device, dtype=torch.bool)
+        history_symbol = (
+            subtask_idx[None, :1]
+            if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL
+            else None
+        )
+        history_latent = self.p1_model.history(
+            feature=feature[None, :1],
+            previous_action=self.normalizer["action"].normalize(previous_action[:1])[None],
+            valid_mask=valid,
+            oracle_symbol=history_symbol,
+        )
+        current = history_latent[:, 0]
+        timestep = torch.full(
+            (1,), int(diffusion_timestep), device=feature.device, dtype=torch.long)
+        normalized_tau = timestep.to(feature.dtype) / max(
+            self.p1_model.group_config.num_diffusion_steps - 1, 1)
+        denominator = max(episode_length - 1, 1)
+        normalized_action = self.normalizer["action"].normalize(action_candidate)
+        rows: list[dict[str, float | int]] = []
+
+        for edge_start in range(episode_length - 1):
+            condition = feature[edge_start:edge_start + 2][None]
+            context = condition.reshape(1, -1)
+            clean_action = normalized_action[edge_start:edge_start + 1]
+            noisy_action = self.noise_scheduler.add_noise(
+                clean_action,
+                noise[edge_start:edge_start + 1],
+                timestep,
+            )
+            split_state = self.model.forward_decoder_pre(
+                noisy_action,
+                timestep,
+                condition,
+                split_layer=self.p1_split_layer,
+            )
+            if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL:
+                oracle = self.p1_model.history.oracle_embedding(
+                    subtask_idx[edge_start:edge_start + 1].to(dtype=torch.long))
+            else:
+                oracle = feature.new_zeros(
+                    (1, self.p1_model.history_config.oracle_dim))
+            next_times = (
+                edge_start
+                + torch.arange(1, self.horizon, device=feature.device)
+            ).to(feature.dtype).div(denominator).clamp_max(1)[None]
+            dynamics = self.p1_model.dynamics(
+                initial_z=current,
+                hidden=split_state.hidden,
+                context=context,
+                normalized_tau=normalized_tau,
+                normalized_next_time=next_times,
+                oracle=oracle,
+                boundary_target=None,
+                teacher_ratio=0.0,
+                max_edges=1,
+            )
+            # Commit only t -> t+1. Candidate edges t+1: are discarded.
+            current = dynamics.z[:, 1]
+            rows.append({
+                "physical_time": edge_start + 1,
+                "probability": float(dynamics.probability[0, 0]),
+                "intensity": float(dynamics.intensity[0, 0]),
+                "target": float(boundary_target[edge_start + 1]),
+            })
+        return rows
 
     def compute_loss(self, batch: Dict[str, Any]):
         action = batch.get("action")
