@@ -99,6 +99,15 @@ val_dataloader:
 
 validation:
   seed: 4242
+  # Locked detailed trajectory probe selected once from the validation split
+  # with numpy default_rng(seed=42), without replacement.
+  probe_episode_ids: [224, 62, 309, 330]
+  probe_noise_seed: 42
+  probe_timesteps:
+    - {name: clean, index: 19}
+    - {name: noisy, index: 78}
+  probe_groups_per_batch: 4
+  probe_every_epochs: 10
 
 training:
   seed: 42

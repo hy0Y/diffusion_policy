@@ -167,11 +167,14 @@ def compute_p1_group_losses(
 
     edge_valid = group_valid[:, None, None].expand_as(boundary_target)
     edge_episode = episode_id[:, None, None].expand_as(boundary_target)
+    # ``physical_time[..., u]`` is the start of edge u -> u+1.  The probe
+    # contract indexes boundary belief by its endpoint t, matching
+    # ``boundary_target[..., u] == boundary_any_hard[t]``.
     edge = edge_balanced_bce_from_intensity_views(
         intensity=output.intensity.reshape(-1),
         target=boundary_target.reshape(-1),
         episode_id=edge_episode.reshape(-1),
-        edge_time=physical_time[:, :, :-1].reshape(-1),
+        edge_time=(physical_time[:, :, :-1] + 1).reshape(-1),
         valid_mask=edge_valid.reshape(-1),
         delta_seconds=delta_seconds,
     )

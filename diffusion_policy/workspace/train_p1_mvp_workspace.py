@@ -31,6 +31,8 @@ import tqdm
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.dataset.p1_mvp_group_dataset import (
+    GROUP_UNION,
+    GroupSampleIndex,
     P1MVPCachedGroupDataset,
     P1MVPRawGroupDataset,
     p1_group_collate,
@@ -46,12 +48,92 @@ from diffusion_policy.dataset.p1_mvp_sampler import (
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.policy.p1_diffusion_transformer_hybrid_image_policy import (
+    P1ExperimentMode,
     P1DiffusionTransformerHybridImagePolicy,
 )
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def full_episode_group_starts(episode_length: int) -> tuple[int, ...]:
+    """Tile every endpoint t=1..T-1 with valid 25-frame P1 groups."""
+    if episode_length < GROUP_UNION:
+        raise ValueError(
+            f"episode length {episode_length} is shorter than {GROUP_UNION}")
+    last_start = episode_length - GROUP_UNION
+    starts = list(range(0, last_start + 1, GROUP_UNION - 1))
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return tuple(starts)
+
+
+def stitch_full_episode_probe_rows(
+        rows: list[dict[str, float | int | str]],
+        *,
+        episode_lengths: dict[int, int],
+    ) -> list[dict[str, float | int | str]]:
+    """Aggregate duplicate group/window views into one row per endpoint."""
+    buckets: dict[tuple[int, str, int, int], list[dict[str, float | int | str]]] = {}
+    for row in rows:
+        key = (
+            int(row["episode_id"]),
+            str(row["tau_name"]),
+            int(row["tau_index"]),
+            int(row["physical_time"]),
+        )
+        buckets.setdefault(key, []).append(row)
+
+    stitched: list[dict[str, float | int | str]] = []
+    for (episode_id, tau_name, tau_index, endpoint), views in sorted(
+            buckets.items()):
+        probabilities = np.asarray(
+            [float(view["probability"]) for view in views], dtype=np.float64)
+        intensities = np.asarray(
+            [float(view["intensity"]) for view in views], dtype=np.float64)
+        targets = {float(view["target"]) for view in views}
+        if len(targets) != 1:
+            raise ValueError("probe views disagree on the GT boundary target")
+        probability = float(probabilities.mean())
+        stitched.append({
+            "episode_id": episode_id,
+            "episode_length": int(episode_lengths[episode_id]),
+            "physical_time": endpoint,
+            "probability": probability,
+            "value": probability,
+            "p_mean": probability,
+            "p_std": float(probabilities.std()),
+            "p_count": int(probabilities.size),
+            "intensity": float(intensities.mean()),
+            "lambda_mean": float(intensities.mean()),
+            "lambda_std": float(intensities.std()),
+            "target": targets.pop(),
+            "tau_name": tau_name,
+            "tau_index": tau_index,
+            "probe_scope": "full_validation_episode",
+        })
+
+    for episode_id, episode_length in episode_lengths.items():
+        tau_keys = {
+            (str(row["tau_name"]), int(row["tau_index"]))
+            for row in stitched if int(row["episode_id"]) == episode_id
+        }
+        expected = set(range(1, episode_length))
+        for tau_name, tau_index in tau_keys:
+            observed = {
+                int(row["physical_time"])
+                for row in stitched
+                if int(row["episode_id"]) == episode_id
+                and row["tau_name"] == tau_name
+                and int(row["tau_index"]) == tau_index
+            }
+            if observed != expected:
+                missing = sorted(expected - observed)
+                raise RuntimeError(
+                    f"full probe coverage failed for episode {episode_id} "
+                    f"tau={tau_name}/{tau_index}; missing={missing[:10]}")
+    return stitched
 
 
 def _to_device(value: Any, device: torch.device) -> Any:
@@ -334,7 +416,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
 
     def _publish_platform_probe(
             self,
-            rows: list[dict[str, float | int]],
+            rows: list[dict[str, float | int | str]],
             *,
             stage: Literal["validation"],
         ) -> None:
@@ -358,6 +440,12 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                 handle.write(
                     json.dumps(payload, sort_keys=True, separators=(",", ":"))
                     + "\n")
+        tau_config = self.cfg.validation.probe_timesteps
+        tau_scope = (
+            OmegaConf.to_container(tau_config, resolve=True)
+            if OmegaConf.is_config(tau_config)
+            else list(tau_config)
+        )
         writer.publish_probe(
             "boundary_probability_trace",
             source,
@@ -368,10 +456,127 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             scope={
                 "p1_mode": self.cfg.policy.p1_mode,
                 "validation_seed": int(self.cfg.validation.seed),
+                "probe_scope": "full_validation_episode",
+                "task": self.cfg.task.source_task,
+                "episode_ids": [
+                    int(value)
+                    for value in self.cfg.validation.probe_episode_ids
+                ],
+                "tau": tau_scope,
             },
             artifact_format="jsonl",
             content_type="application/x-ndjson",
         )
+
+    def _full_episode_probe(
+            self,
+            *,
+            accelerator: Accelerator,
+            policy: P1DiffusionTransformerHybridImagePolicy,
+            dataset,
+            cfg: OmegaConf,
+        ) -> list[dict[str, float | int | str]]:
+        """Run the locked detailed p(t) probe over every episode endpoint."""
+        if policy.p1_mode is P1ExperimentMode.BASELINE:
+            return []
+        episode_ids = tuple(
+            int(value) for value in cfg.validation.probe_episode_ids)
+        available = set(int(value) for value in dataset.store.episode_ids) \
+            if hasattr(dataset, "store") else set(
+                int(value) for value in dataset.episode_ids)
+        missing = sorted(set(episode_ids) - available)
+        if missing:
+            raise ValueError(
+                f"validation probe episodes are outside the split: {missing}")
+        timesteps = tuple(
+            (str(item.name), int(item.index))
+            for item in cfg.validation.probe_timesteps)
+        groups_per_batch = int(cfg.validation.probe_groups_per_batch)
+        if groups_per_batch <= 0:
+            raise ValueError("validation.probe_groups_per_batch must be positive")
+
+        local_ids = episode_ids[
+            accelerator.process_index::accelerator.num_processes]
+        episode_lengths = {
+            episode_id: int(dataset.episode_length(episode_id))
+            for episode_id in local_ids
+        }
+        local_rows: list[dict[str, float | int | str]] = []
+        policy.eval()
+        with torch.no_grad():
+            for episode_id in local_ids:
+                indices = [
+                    GroupSampleIndex(
+                        episode_id=episode_id,
+                        group_start=start,
+                        category="validation_probe",
+                    )
+                    for start in full_episode_group_starts(
+                        episode_lengths[episode_id])
+                ]
+                for tau_name, tau_index in timesteps:
+                    for offset in range(0, len(indices), groups_per_batch):
+                        chunk = indices[offset:offset + groups_per_batch]
+                        batch = p1_group_collate(
+                            [dataset[index] for index in chunk])
+                        seed = self._step_seed(
+                            int(cfg.validation.probe_noise_seed),
+                            tau_index,
+                            episode_id * 1000 + offset,
+                            0,
+                        )
+                        self._seed_step(seed)
+                        batch = _to_device(batch, accelerator.device)
+                        policy.compute_group_loss(
+                            batch,
+                            diffusion_timestep_override=tau_index,
+                        )
+                        for row in policy.last_probe_rows:
+                            local_rows.append({
+                                **row,
+                                "tau_name": tau_name,
+                                "tau_index": tau_index,
+                            })
+
+        local_payload = {
+            "rows": local_rows,
+            "episode_lengths": episode_lengths,
+        }
+        if accelerator.num_processes > 1:
+            gathered: list[dict[str, Any] | None] = [
+                None for _ in range(accelerator.num_processes)
+            ]
+            torch.distributed.all_gather_object(gathered, local_payload)
+            all_rows = [
+                row
+                for payload in gathered if payload is not None
+                for row in payload["rows"]
+            ]
+            all_lengths = {
+                int(episode_id): int(length)
+                for payload in gathered if payload is not None
+                for episode_id, length in payload["episode_lengths"].items()
+            }
+        else:
+            all_rows = local_rows
+            all_lengths = episode_lengths
+        stitched = stitch_full_episode_probe_rows(
+            all_rows, episode_lengths=all_lengths)
+        for row in stitched:
+            row["task"] = str(cfg.task.source_task)
+            row["split"] = "validation"
+        expected_taus = set(timesteps)
+        for episode_id in episode_ids:
+            observed_taus = {
+                (str(row["tau_name"]), int(row["tau_index"]))
+                for row in stitched
+                if int(row["episode_id"]) == episode_id
+            }
+            if observed_taus != expected_taus:
+                raise RuntimeError(
+                    f"missing probe tau for episode {episode_id}: "
+                    f"{observed_taus} != {expected_taus}")
+        return stitched
 
 
 
@@ -577,11 +782,17 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                 validation_policy = accelerator.unwrap_model(self.model)
                 if self.ema_model is not None:
                     validation_policy = self.ema_model
-                validation_metrics, probe_rows = self._validation(
+                validation_metrics, _ = self._validation(
                     accelerator=accelerator,
                     policy=validation_policy,
                     dataset=validation_dataset,
                     sampler=validation_sampler,
+                    cfg=cfg,
+                )
+                probe_rows = self._full_episode_probe(
+                    accelerator=accelerator,
+                    policy=validation_policy,
+                    dataset=validation_dataset,
                     cfg=cfg,
                 )
                 accelerator.log(validation_metrics, step=self.global_step)
@@ -734,13 +945,25 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                     validation_policy = accelerator.unwrap_model(self.model)
                     if self.ema_model is not None:
                         validation_policy = self.ema_model
-                    validation_metrics, probe_rows = self._validation(
+                    validation_metrics, _ = self._validation(
                         accelerator=accelerator,
                         policy=validation_policy,
                         dataset=validation_dataset,
                         sampler=validation_sampler,
                         cfg=cfg,
                     )
+                    probe_rows: list[dict[str, float | int | str]] = []
+                    probe_every = int(cfg.validation.probe_every_epochs)
+                    if probe_every <= 0:
+                        raise ValueError(
+                            "validation.probe_every_epochs must be positive")
+                    if self.epoch % probe_every == 0:
+                        probe_rows = self._full_episode_probe(
+                            accelerator=accelerator,
+                            policy=validation_policy,
+                            dataset=validation_dataset,
+                            cfg=cfg,
+                        )
                     epoch_metrics.update(validation_metrics)
                     accelerator.log(epoch_metrics, step=self.global_step)
                     if accelerator.is_main_process:
@@ -755,8 +978,9 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                             training_step=self.global_step,
                             epoch=float(self.epoch),
                         )
-                        self._publish_platform_probe(
-                            probe_rows, stage="validation")
+                        if probe_rows:
+                            self._publish_platform_probe(
+                                probe_rows, stage="validation")
 
                 if self.epoch % cfg.training.checkpoint_every == 0:
                     if accelerator.is_main_process:

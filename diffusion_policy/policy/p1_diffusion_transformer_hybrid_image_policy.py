@@ -334,7 +334,10 @@ class P1DiffusionTransformerHybridImagePolicy(
         return values.mean()
 
     def compute_group_loss(
-            self, batch: Dict[str, Any]
+            self,
+            batch: Dict[str, Any],
+            *,
+            diffusion_timestep_override: int | Tensor | None = None,
         ) -> tuple[Tensor, P1GroupLossOutput | None]:
         if not self.obs_as_cond:
             raise NotImplementedError("P1 MVP requires obs_as_cond=True")
@@ -351,12 +354,30 @@ class P1DiffusionTransformerHybridImagePolicy(
         context = condition.reshape(batch_size, windows, -1)
 
         noise = self._shared_group_noise(action, physical_time)
-        diffusion_timestep = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (batch_size,),
-            device=action.device,
-        ).long()
+        if diffusion_timestep_override is None:
+            diffusion_timestep = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (batch_size,),
+                device=action.device,
+            ).long()
+        elif isinstance(diffusion_timestep_override, int):
+            diffusion_timestep = torch.full(
+                (batch_size,),
+                diffusion_timestep_override,
+                device=action.device,
+                dtype=torch.long,
+            )
+        else:
+            diffusion_timestep = diffusion_timestep_override.to(
+                device=action.device, dtype=torch.long)
+            if diffusion_timestep.shape != (batch_size,):
+                raise ValueError(
+                    "diffusion_timestep_override must have shape [B]")
+        if bool(torch.any(diffusion_timestep < 0)) or bool(torch.any(
+            diffusion_timestep >= self.noise_scheduler.config.num_train_timesteps
+        )):
+            raise ValueError("diffusion_timestep_override is outside the scheduler")
         flat_timestep = diffusion_timestep[:, None].expand(
             -1, windows).reshape(-1)
         flat_action = action.reshape(batch_size * windows, window, action_dim)

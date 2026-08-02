@@ -230,6 +230,7 @@ def test_group_loss_aggregates_duplicate_edges_and_masks_dummy_group():
     assert result.diffusion.item() == 1.0
     assert result.edge.positive_count == 1
     assert result.edge.edge_time.unique().numel() < windows * (window - 1)
+    assert int(result.edge.edge_time.min()) == int(physical.min()) + 1
     result.total.backward()
     assert prediction.grad is not None
     assert output.intensity.grad is not None

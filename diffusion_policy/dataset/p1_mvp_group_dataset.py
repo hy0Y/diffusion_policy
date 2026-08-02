@@ -284,6 +284,10 @@ class P1MVPCachedGroupDataset(Dataset):
     def __len__(self) -> int:
         return len(self.store.episode_ids)
 
+    def episode_length(self, episode_id: int) -> int:
+        return self.store._load_history_episode(
+            episode_id, self.feature_variant).episode_length
+
     def __getitem__(self, index: GroupSampleIndex) -> dict[str, Any]:
         if not isinstance(index, GroupSampleIndex):
             raise TypeError("P1MVPCachedGroupDataset expects GroupSampleIndex values")
@@ -395,6 +399,9 @@ class P1MVPRawGroupDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.episode_ids)
+
+    def episode_length(self, episode_id: int) -> int:
+        return len(self._load_annotation(episode_id)["frame_index"])
 
     def _global_index(self, episode_id: int, observation_anchor: int) -> int:
         trajectory_index = self.base_dataset.get_trajectory_index(episode_id)

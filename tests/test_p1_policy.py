@@ -140,6 +140,17 @@ def test_oracle_eval_uses_predicted_gate_without_future_boundary():
     assert policy.last_loss_metrics["rho"] == 0.0
 
 
+def test_detailed_probe_uses_fixed_diffusion_timestep():
+    policy = make_policy("oracle_gate_symbol")
+    policy.eval()
+
+    _, details = policy.compute_group_loss(
+        make_batch(), diffusion_timestep_override=7)
+
+    assert details is not None
+    assert len(policy.last_probe_rows) > 0
+
+
 def test_main_schedule_reaches_predicted_gate():
     policy = make_policy("main")
     assert all(
