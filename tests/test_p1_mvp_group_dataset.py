@@ -10,6 +10,7 @@ from diffusion_policy.dataset.p1_mvp_group_dataset import (
     GroupSampleIndex,
     P1MVPCachedGroupDataset,
     P1MVPRawGroupDataset,
+    p1_group_collate,
     shared_physical_time_noise,
 )
 
@@ -96,6 +97,17 @@ def test_cached_group_uses_physical_time_contract(tmp_path):
     np.testing.assert_array_equal(group.boundary_edge_target[0], boundary[1:10])
 
 
+def test_history_prefixes_share_one_worker_local_episode_cache(tmp_path):
+    artifact, _, actions, _ = make_fixture(tmp_path)
+    store = CachedEpisodeStore(artifact, split="train")
+    shorter = store.load_history(7, 16, feature_variant=0)
+    longer = store.load_history(7, 21, feature_variant=0)
+
+    assert np.shares_memory(shorter.feature, longer.feature)
+    assert np.shares_memory(shorter.previous_action, longer.previous_action)
+    np.testing.assert_array_equal(shorter.previous_action[1:], actions[1:16, 0])
+
+
 def test_dataset_accepts_group_index(tmp_path):
     artifact, _, _, _ = make_fixture(tmp_path)
     dataset = P1MVPCachedGroupDataset(
@@ -138,3 +150,34 @@ def test_overlap_uses_exact_same_noise():
     torch.testing.assert_close(noise[0, 5:], noise[1, :5], rtol=0, atol=0)
     torch.testing.assert_close(noise[1, 5:], noise[2, :5], rtol=0, atol=0)
     assert not torch.equal(noise[0, :5], noise[1, :5])
+
+
+def test_collate_deduplicates_nested_histories_per_episode(tmp_path):
+    artifact, _, _, _ = make_fixture(tmp_path)
+    dataset = P1MVPCachedGroupDataset(
+        artifact, split="train", feature_variant=0)
+    shorter = dataset[GroupSampleIndex(7, 0, "episode_start")]
+    longer = dataset[GroupSampleIndex(7, 5, "natural")]
+
+    batch = p1_group_collate([shorter, longer])
+
+    assert batch["episode_id"].tolist() == [7, 7]
+    assert batch["history_episode_id"].tolist() == [7]
+    assert batch["group_to_history"].tolist() == [0, 0]
+    assert batch["history_length"].tolist() == [21]
+    assert batch["history_feature"].shape[:2] == (1, 21)
+    torch.testing.assert_close(
+        batch["history_feature"][0, :16], shorter["history_feature"])
+
+
+def test_baseline_items_skip_unused_history_io(tmp_path):
+    artifact, _, _, _ = make_fixture(tmp_path)
+    base = FakeRawDataset()
+    dataset = P1MVPRawGroupDataset(
+        base, artifact, split="train", include_history=False)
+    item = dataset[GroupSampleIndex(7, 0, "episode_start")]
+
+    assert not any(key.startswith("history_") for key in item)
+    batch = p1_group_collate([item, item])
+    assert batch["action"].shape == (2, 4, 10, 12)
+    assert "group_to_history" not in batch

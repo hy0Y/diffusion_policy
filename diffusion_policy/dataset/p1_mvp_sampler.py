@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator, Literal
 
 import numpy as np
+import pyarrow.parquet as pq
 from torch.utils.data import Sampler
 
 from diffusion_policy.dataset.p1_mvp_group_dataset import (
     GROUP_UNION,
     GroupSampleIndex,
 )
+from diffusion_policy.dataset.p1_mvp_contract import resolve_p1_mvp_split
 
 
 NaturalDonePolicy = Literal["exclude_terminal", "include_terminal"]
@@ -133,6 +136,126 @@ class CandidateStore:
                 & (self._arrays["natural_with_terminal_episode"] == episode_id)
             ],
             episode_start=self._starts("episode_start", episode_id),
+        )
+
+
+class AnnotationCandidateStore:
+    """Build the same candidate pools directly from a locked split annotation.
+
+    The audited NPZ remains the canonical train artifact. This read-only store is
+    primarily for validation/test episodes, which are deliberately absent from
+    that train-only artifact.
+    """
+
+    def __init__(
+            self,
+            split_artifact: str | Path,
+            *,
+            split: str,
+            task: str = "GetToastedBread",
+            annotation_root: str | Path | None = None,
+            cache_root: str | Path | None = None,
+            canonical_sha256: str | None = None,
+        ):
+        contract = resolve_p1_mvp_split(
+            split_artifact,
+            split=split,
+            task=task,
+            annotation_root=annotation_root,
+            cache_root=cache_root,
+            canonical_sha256=canonical_sha256,
+        )
+        self.episode_ids = contract.episode_ids
+        self.annotation_root = contract.annotation_root
+
+    @staticmethod
+    def _segments(values: np.ndarray) -> list[tuple[int, int, int]]:
+        cuts = np.flatnonzero(values[1:] != values[:-1]) + 1
+        starts = np.concatenate((np.asarray([0]), cuts))
+        stops = np.concatenate((cuts, np.asarray([values.size])))
+        return [
+            (int(start), int(stop - 1), int(values[start]))
+            for start, stop in zip(starts, stops)
+        ]
+
+    @lru_cache(maxsize=512)
+    def episode(self, episode_id: int) -> EpisodePools:
+        if episode_id not in self.episode_ids:
+            raise KeyError(f"episode {episode_id} is not in this split")
+        path = self.annotation_root / f"episode_{episode_id:06d}.parquet"
+        table = pq.read_table(
+            path,
+            columns=[
+                "frame_index",
+                "subtask_idx",
+                "stage_text",
+                "boundary_any_hard",
+                "valid_mask",
+            ],
+        ).to_pydict()
+        frame = np.asarray(table["frame_index"], dtype=np.int64)
+        subtask = np.asarray(table["subtask_idx"], dtype=np.int64)
+        stage = np.asarray(table["stage_text"], dtype=str)
+        boundary_mask = np.asarray(table["boundary_any_hard"], dtype=bool)
+        valid = np.asarray(table["valid_mask"], dtype=bool)
+        if not np.array_equal(frame, np.arange(frame.size)) or not np.all(valid):
+            raise ValueError(f"episode {episode_id} violates the P1 frame/valid contract")
+
+        all_starts = np.arange(
+            max(0, frame.size - GROUP_UNION + 1), dtype=np.int64)
+        boundary_frames = np.flatnonzero(boundary_mask).astype(np.int64)
+        centered: list[int] = []
+        centered_terminal: list[int] = []
+        near: list[int] = []
+        for start in all_starts.tolist():
+            stop = start + GROUP_UNION - 1
+            inside = boundary_frames[
+                (boundary_frames >= start) & (boundary_frames <= stop)]
+            if inside.size:
+                if inside.size == 1 and start + 11 <= int(inside[0]) <= start + 13:
+                    centered.append(start)
+                    if stage[int(inside[0])] == "done":
+                        centered_terminal.append(start)
+                continue
+            future = boundary_frames[boundary_frames > stop]
+            if future.size and start + 25 <= int(future[0]) <= start + 32:
+                if stage[int(future[0])] != "done":
+                    near.append(start)
+
+        interior: list[int] = []
+        interior_segment: list[int] = []
+        for segment_number, (lo, hi, _) in enumerate(self._segments(subtask)):
+            stage_values = np.unique(stage[lo : hi + 1])
+            if stage_values.size != 1:
+                raise ValueError("one subtask segment maps to multiple stages")
+            last_start = hi - GROUP_UNION + 1
+            if last_start >= lo and str(stage_values[0]) != "done":
+                starts = np.arange(lo, last_start + 1, dtype=np.int64)
+                interior.extend(starts.tolist())
+                interior_segment.extend([segment_number] * int(starts.size))
+
+        natural_with_terminal = all_starts
+        natural_touches_done = np.asarray([
+            start for start in all_starts.tolist()
+            if np.any(stage[start : start + GROUP_UNION] == "done")
+        ], dtype=np.int64)
+        natural_nonterminal = np.asarray([
+            start for start in all_starts.tolist()
+            if not np.any(stage[start : start + GROUP_UNION] == "done")
+        ], dtype=np.int64)
+        return EpisodePools(
+            episode_id=episode_id,
+            boundary=np.asarray(centered, dtype=np.int64),
+            terminal_boundary=np.asarray(centered_terminal, dtype=np.int64),
+            near=np.asarray(near, dtype=np.int64),
+            interior=np.asarray(interior, dtype=np.int64),
+            interior_segment=np.asarray(interior_segment, dtype=np.int64),
+            natural_nonterminal=natural_nonterminal,
+            natural_with_terminal=natural_with_terminal,
+            natural_touches_done=natural_touches_done,
+            episode_start=(
+                np.asarray([0], dtype=np.int64)
+                if all_starts.size else np.empty(0, dtype=np.int64)),
         )
 
 

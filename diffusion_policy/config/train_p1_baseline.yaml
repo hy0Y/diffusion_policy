@@ -1,0 +1,7 @@
+defaults:
+  - train_p1_mvp
+  - _self_
+
+name: p1_baseline
+policy:
+  p1_mode: baseline

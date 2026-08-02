@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +16,10 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
+from torch.nn.utils.rnn import pad_sequence
+
+from diffusion_policy.dataset.p1_mvp_contract import resolve_p1_mvp_split
 
 
 GROUP_WINDOW = 10
@@ -46,27 +49,46 @@ class CachedGroup:
     context_vector: np.ndarray
     clean_actions: np.ndarray
     boundary_edge_target: np.ndarray
+    subtask_idx: np.ndarray
     stage_local_id: np.ndarray
     semantic_skill_local_id: np.ndarray
+
+
+@dataclass(frozen=True)
+class CachedHistory:
+    feature: np.ndarray
+    previous_action: np.ndarray
+    subtask_idx: np.ndarray
+    prefix_length: int
+    episode_length: int
 
 
 class CachedEpisodeStore:
     """Read locked P1 cache and annotation files without mutating them."""
 
-    def __init__(self, split_artifact: str | Path, *, split: str):
+    def __init__(
+            self,
+            split_artifact: str | Path,
+            *,
+            split: str,
+            task: str = "GetToastedBread",
+            annotation_root: str | Path | None = None,
+            cache_root: str | Path | None = None,
+            canonical_sha256: str | None = None,
+        ):
         artifact_path = Path(split_artifact)
-        manifest = json.loads(artifact_path.read_text(encoding="utf-8"))
-        if split not in ("train", "validation", "test"):
-            raise ValueError("split must be train, validation, or test")
-        if manifest.get("split_id") != "gettoastedbread_mvp_intersection_v1":
-            raise ValueError("unexpected P1 MVP split_id")
-        self.artifact_path = artifact_path
-        self.split_id = manifest["split_id"]
-        self.episode_ids = tuple(
-            int(value) for value in manifest["episodes"][split]
+        contract = resolve_p1_mvp_split(
+            artifact_path,
+            split=split,
+            task=task,
+            annotation_root=annotation_root,
+            cache_root=cache_root,
+            canonical_sha256=canonical_sha256,
         )
-        self.annotation_root = Path(manifest["source"]["annotation_root"])
-        self.cache_root = Path(manifest["source"]["cache_root"])
+        self.artifact_path = artifact_path
+        self.episode_ids = contract.episode_ids
+        self.annotation_root = contract.annotation_root
+        self.cache_root = contract.cache_root
 
     def _paths(self, episode_id: int) -> tuple[Path, Path, Path]:
         if episode_id not in self.episode_ids:
@@ -112,14 +134,18 @@ class CachedEpisodeStore:
             annotation_path,
             columns=[
                 "boundary_any_hard",
+                "subtask_idx",
                 "stage_local_id",
                 "semantic_skill_local_id",
             ],
         ).to_pydict()
         boundary = np.asarray(annotation["boundary_any_hard"], dtype=bool)
+        subtask = np.asarray(annotation["subtask_idx"], dtype=np.int64)
         stage = np.asarray(annotation["stage_local_id"], dtype=np.int64)
         skill = np.asarray(annotation["semantic_skill_local_id"], dtype=np.int64)
-        if not (len(boundary) == len(stage) == len(skill) == frame_count):
+        if not (
+            len(boundary) == len(subtask) == len(stage) == len(skill) == frame_count
+        ):
             raise ValueError("annotation/cache frame counts do not match")
 
         edge_endpoint = physical_time[:, :-1] + 1
@@ -135,8 +161,69 @@ class CachedEpisodeStore:
             context_vector=observation_features.reshape(GROUP_WINDOWS, -1),
             clean_actions=np.asarray(actions[observation_anchors]),
             boundary_edge_target=boundary[edge_endpoint],
+            subtask_idx=subtask[physical_time],
             stage_local_id=stage[physical_time],
             semantic_skill_local_id=skill[physical_time],
+        )
+
+    @lru_cache(maxsize=4)
+    def _load_history_episode(
+            self,
+            episode_id: int,
+            feature_variant: int,
+        ) -> CachedHistory:
+        """Load one writable full-episode history per DataLoader worker."""
+        if feature_variant not in range(5):
+            raise ValueError("feature_variant must be in [0,4]")
+        annotation_path, feature_path, action_path = self._paths(episode_id)
+        features = np.load(feature_path, mmap_mode="r", allow_pickle=False)
+        actions = np.load(action_path, mmap_mode="r", allow_pickle=False)
+        frame_count = int(features.shape[0])
+        if actions.shape[0] != frame_count:
+            raise ValueError("feature/action frame counts do not match")
+        subtask = pq.read_table(
+            annotation_path, columns=["subtask_idx"]
+        )["subtask_idx"].to_numpy(zero_copy_only=False)
+        if len(subtask) != frame_count:
+            raise ValueError("annotation/cache frame counts do not match")
+        previous_action = np.zeros(
+            (frame_count, actions.shape[-1]), dtype=np.float32)
+        if frame_count > 1:
+            previous_action[1:] = np.asarray(actions[1:, 0])
+        return CachedHistory(
+            feature=np.asarray(features[:, feature_variant]).copy(),
+            previous_action=previous_action,
+            subtask_idx=np.asarray(subtask, dtype=np.int64).copy(),
+            prefix_length=frame_count,
+            episode_length=frame_count,
+        )
+
+    def load_history(
+            self,
+            episode_id: int,
+            prefix_length: int,
+            *,
+            feature_variant: int,
+        ) -> CachedHistory:
+        """Load the causal prefix needed by all window starts in one group.
+
+        At physical time ``t`` the history input uses feature ``f[t]`` and the
+        previous expert action ``a[t-1]``. Cached action row ``r=t`` starts at
+        physical action ``t-1``, so ``actions[t, 0]`` is exactly that previous
+        action. Time zero receives the specified all-zero previous action.
+        """
+        episode = self._load_history_episode(episode_id, feature_variant)
+        frame_count = episode.episode_length
+        if not 1 <= prefix_length <= frame_count:
+            raise IndexError(
+                f"history prefix {prefix_length} is outside episode length {frame_count}"
+            )
+        return CachedHistory(
+            feature=episode.feature[:prefix_length],
+            previous_action=episode.previous_action[:prefix_length],
+            subtask_idx=episode.subtask_idx[:prefix_length],
+            prefix_length=prefix_length,
+            episode_length=frame_count,
         )
 
 
@@ -174,12 +261,25 @@ class P1MVPCachedGroupDataset(Dataset):
             *,
             split: str,
             feature_variant: int = 0,
+            include_history: bool = True,
+            task: str = "GetToastedBread",
+            annotation_root: str | Path | None = None,
+            cache_root: str | Path | None = None,
+            canonical_sha256: str | None = None,
         ):
         super().__init__()
         if feature_variant not in range(5):
             raise ValueError("feature_variant must be in [0,4]")
-        self.store = CachedEpisodeStore(split_artifact, split=split)
+        self.store = CachedEpisodeStore(
+            split_artifact,
+            split=split,
+            task=task,
+            annotation_root=annotation_root,
+            cache_root=cache_root,
+            canonical_sha256=canonical_sha256,
+        )
         self.feature_variant = feature_variant
+        self.include_history = bool(include_history)
 
     def __len__(self) -> int:
         return len(self.store.episode_ids)
@@ -192,7 +292,7 @@ class P1MVPCachedGroupDataset(Dataset):
             index.group_start,
             feature_variant=self.feature_variant,
         )
-        return {
+        result = {
             "episode_id": torch.tensor(group.episode_id, dtype=torch.long),
             "group_start": torch.tensor(group.group_start, dtype=torch.long),
             "category": index.category,
@@ -204,10 +304,31 @@ class P1MVPCachedGroupDataset(Dataset):
             "action": torch.from_numpy(group.clean_actions.copy()),
             "boundary_edge_target": torch.from_numpy(
                 group.boundary_edge_target.copy()),
+            "subtask_idx": torch.from_numpy(group.subtask_idx.copy()),
             "stage_local_id": torch.from_numpy(group.stage_local_id.copy()),
             "semantic_skill_local_id": torch.from_numpy(
                 group.semantic_skill_local_id.copy()),
+            "episode_length": torch.tensor(
+                int(group.physical_time.max()) + 1, dtype=torch.long),
         }
+        if self.include_history:
+            prefix_length = int(group.physical_time[-1, 0]) + 1
+            history = self.store.load_history(
+                index.episode_id,
+                prefix_length,
+                feature_variant=self.feature_variant,
+            )
+            result.update({
+                "history_feature": torch.from_numpy(history.feature),
+                "history_previous_action": torch.from_numpy(
+                    history.previous_action),
+                "history_subtask_idx": torch.from_numpy(history.subtask_idx),
+                "history_length": torch.tensor(
+                    history.prefix_length, dtype=torch.long),
+                "episode_length": torch.tensor(
+                    history.episode_length, dtype=torch.long),
+            })
+        return result
 
 
 class P1MVPRawGroupDataset(Dataset):
@@ -226,24 +347,45 @@ class P1MVPRawGroupDataset(Dataset):
             split_artifact: str | Path,
             *,
             split: str,
+            history_feature_variant: int = 0,
+            include_history: bool = True,
+            task: str = "GetToastedBread",
+            annotation_root: str | Path | None = None,
+            cache_root: str | Path | None = None,
+            canonical_sha256: str | None = None,
         ):
         super().__init__()
         artifact_path = Path(split_artifact)
-        manifest = json.loads(artifact_path.read_text(encoding="utf-8"))
-        if split not in ("train", "validation", "test"):
-            raise ValueError("split must be train, validation, or test")
-        if manifest.get("split_id") != "gettoastedbread_mvp_intersection_v1":
-            raise ValueError("unexpected P1 MVP split_id")
+        contract = resolve_p1_mvp_split(
+            artifact_path,
+            split=split,
+            task=task,
+            annotation_root=annotation_root,
+            cache_root=cache_root,
+            canonical_sha256=canonical_sha256,
+        )
         if getattr(base_dataset, "n_obs_steps", None) != 2:
             raise ValueError("P1 raw group dataset requires n_obs_steps=2")
 
         self.base_dataset = base_dataset
         self.artifact_path = artifact_path
-        self.split_id = manifest["split_id"]
-        self.episode_ids = tuple(
-            int(value) for value in manifest["episodes"][split]
+        self.episode_ids = contract.episode_ids
+        self.annotation_root = contract.annotation_root
+        self.include_history = bool(include_history)
+        self.history_store = (
+            CachedEpisodeStore(
+                artifact_path,
+                split=split,
+                task=task,
+                annotation_root=annotation_root,
+                cache_root=cache_root,
+                canonical_sha256=canonical_sha256,
+            )
+            if self.include_history else None
         )
-        self.annotation_root = Path(manifest["source"]["annotation_root"])
+        if history_feature_variant not in range(5):
+            raise ValueError("history_feature_variant must be in [0,4]")
+        self.history_feature_variant = history_feature_variant
         available_ids = getattr(base_dataset, "trajectory_ids", None)
         if available_ids is None:
             raise TypeError("base_dataset must expose trajectory_ids")
@@ -322,7 +464,7 @@ class P1MVPRawGroupDataset(Dataset):
                 f"group [{index.group_start},{index.group_start + GROUP_UNION - 1}] "
                 f"is outside T={frame_count}")
         edge_endpoint = physical_time[:, :-1] + 1
-        return {
+        result = {
             "episode_id": torch.tensor(index.episode_id, dtype=torch.long),
             "group_start": torch.tensor(index.group_start, dtype=torch.long),
             "category": index.category,
@@ -341,7 +483,94 @@ class P1MVPRawGroupDataset(Dataset):
             "semantic_skill_local_id": torch.from_numpy(
                 np.asarray(annotation["semantic_skill_local_id"])[
                     physical_time].copy()),
+            "episode_length": torch.tensor(frame_count, dtype=torch.long),
         }
+        if self.include_history:
+            if self.history_store is None:
+                raise AssertionError("history store was not initialized")
+            prefix_length = int(window_starts[-1]) + 1
+            history = self.history_store.load_history(
+                index.episode_id,
+                prefix_length,
+                feature_variant=self.history_feature_variant,
+            )
+            result.update({
+                "history_feature": torch.from_numpy(history.feature),
+                "history_previous_action": torch.from_numpy(
+                    history.previous_action),
+                "history_subtask_idx": torch.from_numpy(history.subtask_idx),
+                "history_length": torch.tensor(
+                    history.prefix_length, dtype=torch.long),
+            })
+        return result
 
     def get_normalizer(self, **kwargs):
         return self.base_dataset.get_normalizer(**kwargs)
+
+
+_HISTORY_KEYS = (
+    "history_feature",
+    "history_previous_action",
+    "history_subtask_idx",
+)
+
+
+def p1_group_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate groups while encoding each episode history only once.
+
+    A training batch contains eight groups per episode. Their causal histories
+    are nested prefixes of the same episode, so running the history model on all
+    eight copies is redundant. Keep the longest prefix for each episode and
+    return ``group_to_history`` so every group can query that shared encoding.
+    """
+    if not batch:
+        raise ValueError("cannot collate an empty P1 batch")
+    has_history = [all(key in item for key in _HISTORY_KEYS) for item in batch]
+    if not any(has_history):
+        return default_collate(batch)
+    if not all(has_history):
+        raise ValueError("a P1 batch cannot mix items with and without history")
+    for item in batch:
+        missing = [key for key in _HISTORY_KEYS if key not in item]
+        if missing:
+            raise KeyError(f"P1 item is missing history fields: {missing}")
+        lengths = {int(item[key].shape[0]) for key in _HISTORY_KEYS}
+        if lengths != {int(item["history_length"].item())}:
+            raise ValueError("history tensors and history_length disagree")
+
+    episode_to_history: dict[int, int] = {}
+    history_items: list[dict[str, Any]] = []
+    group_to_history: list[int] = []
+    for item in batch:
+        episode_id = int(item["episode_id"].item())
+        history_index = episode_to_history.get(episode_id)
+        if history_index is None:
+            history_index = len(history_items)
+            episode_to_history[episode_id] = history_index
+            history_items.append(item)
+        elif int(item["history_length"].item()) > int(
+                history_items[history_index]["history_length"].item()):
+            history_items[history_index] = item
+        group_to_history.append(history_index)
+
+    fixed = [{
+        key: value for key, value in item.items()
+        if key not in _HISTORY_KEYS and key != "history_length"
+    } for item in batch]
+    result = default_collate(fixed)
+    for key in _HISTORY_KEYS:
+        result[key] = pad_sequence(
+            [item[key] for item in history_items], batch_first=True)
+    result["history_episode_id"] = torch.stack([
+        item["episode_id"] for item in history_items
+    ])
+    result["history_length"] = torch.stack([
+        item["history_length"] for item in history_items
+    ])
+    result["group_to_history"] = torch.tensor(
+        group_to_history, dtype=torch.long)
+    max_length = result["history_feature"].shape[1]
+    result["history_valid_mask"] = (
+        torch.arange(max_length)[None, :] < result["history_length"][:, None]
+    )
+    return result
