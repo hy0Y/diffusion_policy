@@ -87,11 +87,26 @@ def test_shared_noise_is_exact_on_overlap():
 
 def test_baseline_trains_backbone_and_uses_group_batch():
     policy = make_policy("baseline")
-    assert all(parameter.requires_grad for parameter in policy.model.parameters())
+    assert all(
+        parameter.requires_grad
+        for parameter in policy.model.parameters()
+        if parameter.numel() > 0
+    )
     loss, details = policy.compute_group_loss(make_batch())
     assert details is None
     loss.backward()
     assert any(parameter.grad is not None for parameter in policy.model.parameters())
+
+
+def test_zero_element_device_dtype_parameters_are_not_trainable():
+    for mode in ("baseline", "oracle_gate_symbol", "main"):
+        policy = make_policy(mode)
+        dummy_parameters = [
+            parameter for parameter in policy.parameters()
+            if parameter.numel() == 0
+        ]
+        assert dummy_parameters
+        assert all(not parameter.requires_grad for parameter in dummy_parameters)
 
 
 def test_oracle_freezes_backbone_and_trains_only_p1_path():

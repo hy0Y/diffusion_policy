@@ -124,6 +124,14 @@ class P1DiffusionTransformerHybridImagePolicy(
                 self.p1_model.history.oracle_embedding.requires_grad_(False)
             self._freeze_pretrained_backbone()
 
+        # ModuleAttrMixin and mask generators register zero-element parameters
+        # only to expose module device/dtype. They never participate in the
+        # forward graph, so leaving them trainable breaks DDP on iteration two
+        # when find_unused_parameters=False.
+        for parameter in self.parameters():
+            if parameter.numel() == 0:
+                parameter.requires_grad_(False)
+
         self.register_buffer(
             "p1_training_progress",
             torch.tensor(0.0),

@@ -2,6 +2,6 @@ defaults:
   - train_p1_mvp
   - _self_
 
-name: p1_main_full
+name: p1_main_full_dit_freeze
 policy:
   p1_mode: main

@@ -2,6 +2,6 @@ defaults:
   - train_p1_mvp
   - _self_
 
-name: p1_baseline
+name: p1_baseline_dit_unfreeze
 policy:
   p1_mode: baseline

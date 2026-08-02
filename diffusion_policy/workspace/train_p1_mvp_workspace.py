@@ -79,7 +79,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
         seed = int(cfg.training.seed)
-        torch.manual_seed(seed)
+        torch.random.default_generator.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
 
@@ -138,7 +138,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         elif cfg.task.input_path == "cached":
             if not include_history:
                 raise ValueError(
-                    "P1-Baseline must use raw observations so its observation "
+                    "P1-Baseline-DiT-Unfreeze must use raw observations so its observation "
                     "encoder is fine-tuned")
             train_dataset = P1MVPCachedGroupDataset(
                 cfg.task.split_artifact,
@@ -197,15 +197,17 @@ class TrainP1MVPWorkspace(BaseWorkspace):
 
     @staticmethod
     def _loader(dataset, schedule, cfg: OmegaConf, *, start_batch: int = 0):
+        num_workers = int(cfg.num_workers)
         return DataLoader(
             dataset,
             batch_sampler=EpisodeBundleBatchSampler(
                 schedule, start_batch=start_batch),
             collate_fn=p1_group_collate,
-            num_workers=int(cfg.num_workers),
+            num_workers=num_workers,
             pin_memory=bool(cfg.pin_memory),
             persistent_workers=(
-                bool(cfg.persistent_workers) and int(cfg.num_workers) > 0),
+                bool(cfg.persistent_workers) and num_workers > 0),
+            multiprocessing_context="spawn" if num_workers > 0 else None,
         )
 
     @staticmethod
@@ -214,9 +216,9 @@ class TrainP1MVPWorkspace(BaseWorkspace):
 
     @staticmethod
     def _seed_step(seed: int) -> None:
-        torch.manual_seed(seed)
+        torch.random.default_generator.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+            torch.cuda.manual_seed(seed)
 
     @staticmethod
     def _reduce_metrics(
@@ -312,6 +314,11 @@ class TrainP1MVPWorkspace(BaseWorkspace):
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        # Keep W&B local files with this Hydra run even outside expctl.
+        # Under expctl, self.output_dir is the platform Run directory.
+        wandb_dir = pathlib.Path(self.output_dir) / "tracking" / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["WANDB_DIR"] = str(wandb_dir)
         configured_groups = int(cfg.sampling.groups_per_episode)
         required_groups = sum(CATEGORY_QUOTA.values())
         if configured_groups != required_groups:
@@ -441,6 +448,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         self.optimizer.zero_grad()
 
         with JsonLogger(log_path) as json_logger:
+            stop_after_step = False
             while self.epoch < cfg.training.num_epochs:
                 global_schedule = train_sampler.sample_epoch(epoch=self.epoch)
                 rank_schedule = self._rank_schedule(
@@ -537,6 +545,15 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                         if accelerator.is_main_process:
                             self._save_training_checkpoint(accelerator)
                         accelerator.wait_for_everyone()
+
+                    max_train_steps = cfg.training.get("max_train_steps")
+                    if max_train_steps is not None \
+                            and self.global_step >= int(max_train_steps):
+                        stop_after_step = True
+                        break
+
+                if stop_after_step:
+                    break
 
                 self.epoch += 1
                 self.batch_in_epoch = 0

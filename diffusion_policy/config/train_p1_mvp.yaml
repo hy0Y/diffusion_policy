@@ -2,7 +2,7 @@ defaults:
   - _self_
   - task: robocasa/p1_gettoastedbread_mvp
 
-name: p1_baseline
+name: p1_baseline_dit_unfreeze
 _target_: diffusion_policy.workspace.train_p1_mvp_workspace.TrainP1MVPWorkspace
 
 task_name: ${task.name}
@@ -82,17 +82,17 @@ optimizer:
   betas: [0.9, 0.95]
 
 sampling:
-  episodes_per_rank: 4
+  episodes_per_rank: 3
   groups_per_episode: 8
   natural_done_policy: include_terminal
 
 dataloader:
-  num_workers: 16
+  num_workers: 4
   pin_memory: true
   persistent_workers: false
 
 val_dataloader:
-  num_workers: 8
+  num_workers: 2
   pin_memory: true
   persistent_workers: false
 
@@ -106,7 +106,8 @@ training:
   num_epochs: 100
   gradient_accumulate_every: 1
   lr_scheduler: cosine
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 250
+  max_train_steps: null
   max_grad_norm: 1.0
   use_ema: true
   val_every: 5
@@ -138,7 +139,7 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/p1/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}
+    dir: ${oc.env:SEM_BIF_HYDRA_RUN_DIR,data/outputs/p1/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}}
   sweep:
-    dir: data/outputs/p1/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}
+    dir: ${oc.env:SEM_BIF_HYDRA_RUN_DIR,data/outputs/p1/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}}
     subdir: ${hydra.job.num}
