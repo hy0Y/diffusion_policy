@@ -21,9 +21,6 @@ from pathlib import Path
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.env_runner.p1_rollout_trace import (
-    P1RolloutTraceWriter, committed_first_edge,
-)
 from diffusion_policy.env.robomimic.seeded_robomimic_image_wrapper import (
     SeededRobomimicImageWrapper,
 )
@@ -51,7 +48,7 @@ def create_env(split, env_name, seed=None):
     return env
 
 
-class RobomimicImageRunner(BaseImageRunner):
+class SeededRobomimicImageRunner(BaseImageRunner):
     """
     Robomimic envs already enforces number of steps.
     """
@@ -236,9 +233,6 @@ class RobomimicImageRunner(BaseImageRunner):
         self.reset_mode = reset_mode
         self.episode_root = episode_root
         self.initial_state_index = initial_state_index
-        # Set by the rollout worker only for offline-reference Oracle evaluation.
-        self.p1_oracle_subtask_idx = None
-        self.p1_trace_metadata = None
 
     def run(self, policy: BaseImagePolicy):
         device = policy.device
@@ -256,15 +250,6 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
-        is_p1 = bool(getattr(policy, "is_p1_latent", False))
-        if is_p1 and (n_envs != 1 or self.n_action_steps != 1):
-            raise RuntimeError("P1 committed trace requires n_envs=1 and n_action_steps=1")
-        oracle_sequence = self.p1_oracle_subtask_idx
-        trace_writer = (
-            P1RolloutTraceWriter(self.output_dir, self.p1_trace_metadata or {})
-            if is_p1 else None
-        )
-        physical_step = 0
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -296,11 +281,6 @@ class RobomimicImageRunner(BaseImageRunner):
             while not done:
                 # create obs dict
                 np_obs_dict = dict(obs)
-                if oracle_sequence is not None:
-                    if physical_step >= len(oracle_sequence):
-                        raise RuntimeError("offline Oracle sequence exhausted during rollout")
-                    np_obs_dict['oracle_symbol'] = np.asarray(
-                        [oracle_sequence[physical_step]], dtype=np.int64)
                 if self.past_action and (past_action is not None):
                     # TODO: not tested
                     np_obs_dict['past_action'] = past_action[
@@ -337,21 +317,11 @@ class RobomimicImageRunner(BaseImageRunner):
 
                 # # Concatenate along the last axis (axis=-1)
                 # env_action = np.concatenate([env_action, base_ac_expanded], axis=-1)
-                if trace_writer is not None:
-                    oracle_idx = (
-                        int(oracle_sequence[physical_step])
-                        if oracle_sequence is not None else None
-                    )
-                    trace_writer.append(committed_first_edge(
-                        policy.last_online_probe, action[0, 0], env_action[0, 0],
-                        oracle_subtask_idx=oracle_idx,
-                    ))
                 obs, reward, done, info = env.step(env_action)
                 # done = np.all(done)
                 # for robocasa switch to the proper success check
                 done = np.all(done) or np.all([this_info["success"][0] for this_info in info])
                 past_action = action
-                physical_step += action.shape[1]
 
                 # update pbar
                 pbar.update(action.shape[1])
@@ -366,8 +336,6 @@ class RobomimicImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
-        if trace_writer is not None:
-            log_data.update(trace_writer.finalize())
         log_data['evaluation/reset_mode'] = reset_mode
         log_data['evaluation/environment_seeds'] = (
             list(self.env_seeds) if reset_mode == "generated_seed" else [])

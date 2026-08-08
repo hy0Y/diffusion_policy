@@ -1,0 +1,10 @@
+# @package _global_
+experiment:
+  name: e1_f
+
+policy:
+  semantic_enabled: true
+  direct_boundary_enabled: false
+  bifurcation_enabled: false
+  train_diffusion: false
+  freeze_transformer: true

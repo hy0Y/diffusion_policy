@@ -1,0 +1,7 @@
+defaults:
+  - train_p1_mvp
+  - _self_
+
+name: p1_oracle_gate_symbol_dit_freeze
+policy:
+  p1_mode: oracle_gate_symbol

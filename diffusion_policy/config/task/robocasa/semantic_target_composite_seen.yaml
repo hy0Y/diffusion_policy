@@ -1,0 +1,65 @@
+name: semantic_target_composite_seen
+
+shape_meta: &shape_meta
+  obs:
+    robot0_agentview_right_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ["video.robot0_agentview_right"]
+    robot0_agentview_left_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ["video.robot0_agentview_left"]
+    robot0_eye_in_hand_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: ["video.robot0_eye_in_hand"]
+    robot0_base_to_eef_pos:
+      shape: [3]
+      lerobot_keys: ["state.end_effector_position_relative"]
+    robot0_base_to_eef_quat:
+      shape: [4]
+      lerobot_keys: ["state.end_effector_rotation_relative"]
+    robot0_gripper_qpos:
+      shape: [2]
+      lerobot_keys: ["state.gripper_qpos"]
+    lang_emb:
+      shape: [768]
+  action:
+    shape: [12]
+    lerobot_keys:
+      - "action.end_effector_position"
+      - "action.end_effector_rotation"
+      - "action.gripper_close"
+      - "action.base_motion"
+      - "action.control_mode"
+
+ckpt_path: /data/sem_bif/checkpoints/robocasa365/diffusion_policy/human300/epoch=0500-test_mean_score=-1.000.ckpt
+
+semantic_metadata:
+  split: composite_seen
+  num_subtask_classes: 587
+  num_semantic_skill_classes: 28
+  num_stage_classes: 7
+  loss_weights_path: /data/sem_bif/derived/action_item_01_gt/v1/loss_weights.json
+  vocab_path: /data/sem_bif/derived/action_item_01_gt/v1/split_label_vocab.json
+  split_manifest_path: /data/sem_bif/derived/action_item_01_gt/v1/split_manifest.json
+
+dataset:
+  _target_: diffusion_policy.dataset.lerobot_semantic_dataset.LerobotSemanticCotrainingDataset
+  shape_meta: *shape_meta
+  dataset_soup: target_composite_seen
+  semantic_gt_root: /data/sem_bif/derived/action_item_01_gt/v1
+  split_manifest_path: ${task.semantic_metadata.split_manifest_path}
+  future_offset: 8
+  split_role: train
+  horizon: ${horizon}
+  pad_before: ${eval:"${n_obs_steps}-1+${n_latency_steps}"}
+  pad_after: ${eval:"${n_action_steps}-1"}
+  n_obs_steps: ${dataset_obs_steps}
+  abs_action: false
+  rotation_rep: rotation_6d
+  use_legacy_normalizer: false
+  use_cache: true
+  seed: ${training.seed}
+  val_ratio: 0.02
