@@ -36,6 +36,9 @@ from diffusion_policy.dataset.p1_mvp_group_dataset import (
     P1MVPRawGroupDataset,
     p1_group_collate,
 )
+from diffusion_policy.model.common.normalizer_config import (
+    linear_normalizer_from_spec,
+)
 from diffusion_policy.dataset.p1_mvp_sampler import (
     AnnotationCandidateStore,
     CATEGORY_QUOTA,
@@ -160,12 +163,24 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                 cache_root=cfg.task.cache_root,
                 canonical_sha256=cfg.task.split_manifest_sha256,
             )
-            # This object supplies the checkpoint-compatible action normalizer only.
-            # Samples come exclusively from the cached group datasets.
-            base_dataset = hydra.utils.instantiate(cfg.task.base_dataset)
+            # Cached features carry an explicit preprocessing contract, so no
+            # single-task dataset normalizer should participate in this path.
+            base_dataset = None
         else:
             raise ValueError("task.input_path must be raw or cached")
         return base_dataset, train_dataset, validation_dataset
+
+    @staticmethod
+    def _input_normalizer(cfg: OmegaConf, base_dataset):
+        if cfg.task.input_path == "cached":
+            spec = cfg.task.get("cache_normalizer")
+            if spec is None:
+                raise ValueError(
+                    "cached P1 input requires task.cache_normalizer")
+            return linear_normalizer_from_spec(spec)
+        if base_dataset is None:
+            raise AssertionError("raw P1 input requires a base dataset")
+        return base_dataset.get_normalizer()
 
     @staticmethod
     def _make_candidate_store(
@@ -320,6 +335,7 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             resolved_id,
             self.global_step,
             aliases=aliases,
+            epoch=int(self.epoch),
             metrics=metrics,
             metadata={
                 "p1_mode": self.cfg.policy.p1_mode,
@@ -586,11 +602,6 @@ class TrainP1MVPWorkspace(BaseWorkspace):
         self._output_dir = output_list[0]
 
         base_dataset, train_dataset, validation_dataset = self._make_datasets(cfg)
-        normalizer = base_dataset.get_normalizer()
-        self.model.set_normalizer(normalizer)
-        if self.ema_model is not None:
-            self.ema_model.set_normalizer(normalizer)
-
         train_store = self._make_candidate_store(
             split="train",
             split_artifact=cfg.task.split_artifact,
@@ -649,16 +660,31 @@ class TrainP1MVPWorkspace(BaseWorkspace):
             last_epoch=self.global_step - 1,
         )
 
-        resume_path = self.get_checkpoint_path()
-        if cfg.training.resume and resume_path.is_file():
+        explicit_resume = cfg.training.get("resume_checkpoint")
+        if explicit_resume:
+            resume_path = pathlib.Path(str(explicit_resume)).expanduser().resolve(strict=True)
+            accelerator.print(f"Resuming P1 MVP from explicit checkpoint {resume_path}")
+            continuation_keys = tuple(key for key in self.include_keys if key != "_output_dir")
+            self.load_checkpoint(path=resume_path, include_keys=continuation_keys)
+        else:
+            resume_path = self.get_checkpoint_path()
+        if explicit_resume is None and cfg.training.resume and resume_path.is_file():
             accelerator.print(f"Resuming P1 MVP from {resume_path}")
             self.load_checkpoint(path=resume_path)
-        else:
+        elif explicit_resume is None:
             accelerator.print(
                 f"Initializing P1 MVP from {cfg.task.ckpt_path}"
                 f"[{cfg.task.ckpt_state_key}]")
             self._load_initial_checkpoint(
                 cfg.task.ckpt_path, cfg.task.ckpt_state_key)
+
+        # A cached observation feature already encodes one exact preprocessing
+        # transform. Apply that transform after every initial/resume load so an
+        # older checkpoint cannot restore the Human300 normalizer over it.
+        normalizer = self._input_normalizer(cfg, base_dataset)
+        self.model.set_normalizer(normalizer)
+        if self.ema_model is not None:
+            self.ema_model.set_normalizer(normalizer)
 
         ema: EMAModel | None = None
         if self.ema_model is not None:
@@ -847,7 +873,8 @@ class TrainP1MVPWorkspace(BaseWorkspace):
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 epoch_metrics: dict[str, float] = {}
-                if self.epoch % cfg.training.val_every == 0:
+                if bool(cfg.training.get("validation_enabled", True)) \
+                        and self.epoch % cfg.training.val_every == 0:
                     validation_policy = accelerator.unwrap_model(self.model)
                     if self.ema_model is not None:
                         validation_policy = self.ema_model

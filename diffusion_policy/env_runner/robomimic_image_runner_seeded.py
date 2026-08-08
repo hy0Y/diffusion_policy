@@ -87,6 +87,13 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         # disable object state observation
         self.env_kwargs = OmegaConf.to_container(env_kwargs) if env_kwargs is not None else {}
         env_name = self.env_kwargs["env_name"]
+        reset_mode = self.env_kwargs.get("reset_mode", "generated_seed")
+        if reset_mode not in {"generated_seed", "demonstration_state"}:
+            raise ValueError(f"Unsupported rollout reset mode: {reset_mode}")
+        episode_root = self.env_kwargs.get("episode_root")
+        initial_state_index = int(self.env_kwargs.get("initial_state_index", 0))
+        if reset_mode == "demonstration_state" and not episode_root:
+            raise ValueError("demonstration_state rollout requires episode_root")
 
         rotation_transformer = None
         if abs_action:
@@ -176,7 +183,8 @@ class SeededRobomimicImageRunner(BaseImageRunner):
             seed = test_start_seed + i
             enable_render = i < n_test_vis
 
-            def init_fn(env, seed=seed, 
+            def init_fn(env, seed=seed, reset_mode=reset_mode,
+                episode_root=episode_root, initial_state_index=initial_state_index,
                 enable_render=enable_render):
                 # setup rendering
                 # video_wrapper
@@ -190,10 +198,13 @@ class SeededRobomimicImageRunner(BaseImageRunner):
                     filename = str(filename)
                     env.env.file_path = filename
 
-                # switch to seed reset
+                # Select exactly one reset source for the next reset.
                 assert isinstance(env.env.env, SeededRobomimicImageWrapper)
-                env.env.env.init_state = None
-                env.env.env.set_reset_seed(seed)
+                if reset_mode == "demonstration_state":
+                    env.env.env.set_reset_snapshot(
+                        episode_root, state_index=initial_state_index)
+                else:
+                    env.env.env.set_reset_seed(seed)
 
             env_seeds.append(seed)
             env_prefixs.append('test/')
@@ -219,11 +230,17 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         self.rotation_transformer = rotation_transformer
         self.abs_action = abs_action
         self.tqdm_interval_sec = tqdm_interval_sec
+        self.reset_mode = reset_mode
+        self.episode_root = episode_root
+        self.initial_state_index = initial_state_index
 
     def run(self, policy: BaseImagePolicy):
         device = policy.device
         dtype = policy.dtype
         env = self.env
+        reset_mode = self.reset_mode
+        episode_root = self.episode_root
+        initial_state_index = self.initial_state_index
         
         # plan for rollout
         n_envs = len(self.env_fns)
@@ -319,8 +336,13 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
-        log_data['evaluation/environment_seeds'] = list(self.env_seeds)
-        log_data['evaluation/explicit_seed_reset'] = True
+        log_data['evaluation/reset_mode'] = reset_mode
+        log_data['evaluation/environment_seeds'] = (
+            list(self.env_seeds) if reset_mode == "generated_seed" else [])
+        log_data['evaluation/explicit_seed_reset'] = reset_mode == "generated_seed"
+        if reset_mode == "demonstration_state":
+            log_data['evaluation/episode_root'] = str(episode_root)
+            log_data['evaluation/initial_state_index'] = initial_state_index
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
         # fortunately this won't invalidate our conclusion since
@@ -333,16 +355,19 @@ class SeededRobomimicImageRunner(BaseImageRunner):
         print(f"Success rate: {success_rate}")
         for i in range(n_inits):
             seed = self.env_seeds[i]
+            result_id = (
+                seed if reset_mode == "generated_seed"
+                else Path(episode_root).name)
             prefix = self.env_prefixs[i]
             max_reward = np.max(all_rewards[i])
             max_rewards[prefix].append(max_reward)
-            log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+            log_data[prefix+f'sim_max_reward_{result_id}'] = max_reward
 
             # visualize sim
             video_path = all_video_paths[i]
             if video_path is not None:
                 sim_video = wandb.Video(video_path, format="mp4")
-                log_data[prefix+f'sim_video_{seed}'] = sim_video
+                log_data[prefix+f'sim_video_{result_id}'] = sim_video
         env_name = self.env_kwargs["env_name"]
         log_data[f'success_rate/{env_name}'] = success_rate
         # log aggregate metrics

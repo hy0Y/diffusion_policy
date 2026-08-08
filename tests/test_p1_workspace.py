@@ -8,6 +8,9 @@ from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
 from diffusion_policy.workspace.train_p1_mvp_workspace import TrainP1MVPWorkspace
 
 
+IDENTITY_SHA256 = "1788614c245557148e030eaab54f5a37bc5706b9fcad0af043a5307e3db08d5a"
+
+
 def workspace_config():
     return OmegaConf.create({
         "training": {"seed": 17, "use_ema": True},
@@ -97,6 +100,31 @@ class CapturingSignalWriter:
 
     def publish_probe(self, *args, **kwargs):
         self.probe_calls.append((args, kwargs))
+
+
+def test_cached_input_uses_declared_cache_normalizer_not_base_dataset():
+    cfg = OmegaConf.create({
+        "task": {
+            "input_path": "cached",
+            "cache_normalizer": {
+                "format_version": "linear_normalizer_transform_v1",
+                "transform_sha256": IDENTITY_SHA256,
+                "fields": {"state": {"kind": "identity", "size": 1}},
+            },
+        },
+    })
+
+    class UnexpectedBaseDataset:
+        @staticmethod
+        def get_normalizer():
+            raise AssertionError("cached input must not use base_dataset normalizer")
+
+    normalizer = TrainP1MVPWorkspace._input_normalizer(
+        cfg, UnexpectedBaseDataset())
+    torch.testing.assert_close(
+        normalizer.normalize({"state": torch.tensor([[2.0]])})["state"],
+        torch.tensor([[2.0]]),
+    )
 
 
 def test_workspace_checkpoint_restores_mid_epoch_and_ema_state(tmp_path):

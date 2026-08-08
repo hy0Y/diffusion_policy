@@ -54,6 +54,44 @@ train_candidate_artifact: ${oc.env:P1_MVP_CANDIDATE_ARTIFACT,null}
 input_path: cached
 history_feature_variant: 0
 
+# Exact affine transform used before the frozen Human300 observation encoder
+# when v1_center_random4 was generated. Online rollout must reconstruct live
+# features with this same transform; the foundation checkpoint normalizer is
+# intentionally not part of this contract.
+cache_normalizer:
+  format_version: linear_normalizer_transform_v1
+  transform_sha256: 1bb9ab96a35b00e1aa840fcb642362f1db972d1733dc6d37a29935faac8761b0
+  source:
+    cache_release: v1_center_random4
+    dataset_soup: target_composite_seen
+    statistics: merged_metadata
+    expected_episode_count: 8000
+    expected_frame_count: 5954038
+  fields:
+    action:
+      kind: identity
+      size: 12
+    lang_emb:
+      kind: identity
+      size: 768
+    robot0_agentview_left_image:
+      kind: image_range
+    robot0_agentview_right_image:
+      kind: image_range
+    robot0_eye_in_hand_image:
+      kind: image_range
+    robot0_base_to_eef_quat:
+      kind: identity
+      size: 4
+    robot0_base_to_eef_pos:
+      kind: affine
+      scale: [1.4062104225158691, 1.1704314947128296, 1.4565727710723877]
+      offset: [-0.2607501149177551, -0.00012028217315673828, -0.5545661449432373]
+    robot0_gripper_qpos:
+      kind: affine
+      scale: [25.115785598754883, 26.718080520629883]
+      offset: [-0.4979690909385681, 0.8230366706848145]
+
 base_dataset:
   _target_: diffusion_policy.dataset.lerobot_dataset.LerobotDataset
   shape_meta: *shape_meta

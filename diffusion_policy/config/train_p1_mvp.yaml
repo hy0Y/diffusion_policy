@@ -65,9 +65,13 @@ policy:
   p1_beta_overlap_max: 0.05
   p1_teacher_force_until: 0.40
   p1_teacher_force_end: 0.60
-  p1_online_episode_length: 600
+  # Full diffusion-step x horizon latent traces are diagnostic-only.
+  # Compact online probes keep only per-tau consistency by default.
+  p1_online_store_full_diffusion_trace: false
   # Cached-feature Baseline is DiT-only; no raw observation reaches the encoder.
   p1_train_obs_encoder: false
+  # Latent Oracle/Main experiments preserve the historical DiT freeze by default.
+  p1_dit_trainable: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -82,6 +86,7 @@ optimizer:
   obs_encoder_weight_decay: 1.0e-6
   p1_weight_decay: 1.0e-3
   learning_rate: 1.0e-4
+  dit_learning_rate: null
   betas: [0.9, 0.95]
 
 sampling:
@@ -103,7 +108,7 @@ validation:
   seed: 4242
   # Locked detailed trajectory probe selected once from the validation split
   # with numpy default_rng(seed=42), without replacement.
-  probe_episode_ids: [224, 62, 309, 330]
+  probe_episode_ids: [224, 62, 309]
   probe_noise_seed: 42
   probe_timesteps:
     - {name: clean, index: 19}
@@ -114,13 +119,15 @@ training:
   seed: 42
   debug: false
   resume: false
+  resume_checkpoint: null
   num_epochs: 50
   gradient_accumulate_every: 1
   lr_scheduler: cosine
-  lr_warmup_steps: 125
+  lr_warmup_steps: 375
   max_train_steps: null
   max_grad_norm: 1.0
   use_ema: true
+  validation_enabled: true
   val_every: 5
   checkpoint_every: 5
   validation_only: false

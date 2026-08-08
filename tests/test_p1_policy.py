@@ -1,3 +1,4 @@
+import pytest
 import torch
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
@@ -7,7 +8,10 @@ from diffusion_policy.policy.p1_diffusion_transformer_hybrid_image_policy import
 )
 
 
-def make_policy(mode: str):
+def make_policy(
+    mode: str,
+    p1_online_episode_length: int | None = 20,
+):
     policy = P1DiffusionTransformerHybridImagePolicy(
         shape_meta={
             "obs": {"state": {"shape": [5], "type": "low_dim"}},
@@ -42,6 +46,7 @@ def make_policy(mode: str):
         p1_dynamics_hidden_dim=10,
         p1_feedback_hidden_dim=9,
         p1_group_stride=3,
+        p1_online_episode_length=p1_online_episode_length,
     )
     policy.normalizer["action"] = SingleFieldLinearNormalizer.create_identity()
     policy.normalizer["state"] = SingleFieldLinearNormalizer.create_identity()
@@ -75,6 +80,33 @@ def make_batch(batch_size=2):
         "group_to_history": torch.arange(batch_size, dtype=torch.long),
         "episode_length": torch.full((batch_size,), 20, dtype=torch.long),
     }
+
+
+def test_pretrained_backbone_does_not_overwrite_target_normalizer():
+    target = make_policy("main")
+    foundation = make_policy("main")
+    with torch.no_grad():
+        target.normalizer["state"].params_dict["scale"].fill_(3.0)
+        foundation.normalizer["state"].params_dict["scale"].fill_(7.0)
+        next(foundation.model.parameters()).fill_(0.125)
+    expected_normalizer = {
+        key: value.clone()
+        for key, value in target.normalizer.state_dict().items()
+    }
+    foundation_state = {
+        key: value
+        for key, value in foundation.state_dict().items()
+        if not key.startswith(("p1_model.", "p1_training_progress"))
+    }
+
+    target.load_pretrained_backbone(foundation_state)
+
+    for key, expected in expected_normalizer.items():
+        torch.testing.assert_close(target.normalizer.state_dict()[key], expected)
+    torch.testing.assert_close(
+        next(target.model.parameters()),
+        torch.full_like(next(target.model.parameters()), 0.125),
+    )
 
 
 def test_shared_noise_is_exact_on_overlap():
@@ -208,31 +240,242 @@ def test_sequential_episode_probe_commits_latent_across_every_edge():
             episode_length - 1, policy.horizon, 3, generator=generator),
     )
 
+    assert [row["action_time"] for row in rows] == [0, 1, 2, 3]
     assert [row["physical_time"] for row in rows] == [1, 2, 3, 4]
     assert [row["target"] for row in rows] == [1.0, 0.0, 1.0, 0.0]
     assert len(calls) == episode_length - 1
     for previous, current in zip(calls, calls[1:]):
         torch.testing.assert_close(current[0], previous[1])
 
-def test_latent_modes_online_inference_persist_physical_frame_history():
+@pytest.mark.parametrize("mode", ["main", "oracle_gate_symbol"])
+def test_sequential_episode_probe_reencodes_causal_prefix_every_step(mode):
+    policy = make_policy(mode)
+    policy.eval()
+    policy.set_training_progress(1.0)
+    episode_length = 5
+    generator = torch.Generator().manual_seed(719)
+    feature = torch.randn(episode_length, 5, generator=generator)
+    subtask_idx = torch.arange(episode_length, dtype=torch.long)
+    previous_action = torch.randn(episode_length, 3, generator=generator)
+    previous_action[0].zero_()
+    action_candidate = torch.randn(
+        episode_length - 1, policy.horizon, 3, generator=generator)
+    noise = torch.randn(
+        episode_length - 1, policy.horizon, 3, generator=generator)
+
+    history_inputs = []
+    history_outputs = []
+    dynamics_calls = []
+    original_history = policy.p1_model.history.forward
+    original_dynamics = policy.p1_model.dynamics.forward
+
+    def recording_history(*args, **kwargs):
+        history_inputs.append({
+            "feature": kwargs["feature"].detach().clone(),
+            "previous_action": kwargs["previous_action"].detach().clone(),
+            "oracle_symbol": kwargs.get("oracle_symbol"),
+        })
+        output = original_history(*args, **kwargs)
+        history_outputs.append(output.detach().clone())
+        return output
+
+    def recording_dynamics(*args, **kwargs):
+        output = original_dynamics(*args, **kwargs)
+        dynamics_calls.append((
+            kwargs["initial_z"].detach().clone(),
+            output.z[:, 1].detach().clone(),
+        ))
+        return output
+
+    policy.p1_model.history.forward = recording_history
+    policy.p1_model.dynamics.forward = recording_dynamics
+    policy.compute_sequential_episode_probe(
+        feature=feature,
+        action_candidate=action_candidate,
+        previous_action=previous_action,
+        subtask_idx=subtask_idx,
+        boundary_target=torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]),
+        diffusion_timestep=7,
+        noise=noise,
+    )
+
+    assert len(history_inputs) == episode_length - 1
+    for edge_start, history_input in enumerate(history_inputs):
+        prefix_length = edge_start + 1
+        assert history_input["feature"].shape[1] == prefix_length
+        torch.testing.assert_close(
+            history_input["feature"], feature[None, :prefix_length])
+        torch.testing.assert_close(
+            history_input["previous_action"],
+            previous_action[None, :prefix_length],
+        )
+        if mode == "oracle_gate_symbol":
+            torch.testing.assert_close(
+                history_input["oracle_symbol"],
+                subtask_idx[None, :prefix_length],
+            )
+        else:
+            assert history_input["oracle_symbol"] is None
+
+    torch.testing.assert_close(
+        dynamics_calls[0][0], history_outputs[0][:, -1])
+    for step in range(1, episode_length - 1):
+        expected = (
+            0.5 * dynamics_calls[step - 1][1]
+            + 0.5 * history_outputs[step][:, -1]
+        )
+        torch.testing.assert_close(dynamics_calls[step][0], expected)
+    assert policy._p1_online_history_feature is None
+    assert policy._p1_online_history_action is None
+
+    assert policy._p1_online_history_symbol is None
+
+def test_latent_modes_online_inference_match_training_history_carry_mix():
     for mode in ("oracle_gate_symbol", "main"):
         policy = make_policy(mode)
         policy.eval()
         policy.n_action_steps = 1
         policy.num_inference_steps = 2
-        first = policy.predict_action({
-            "state": torch.randn(1, 2, 5),
-        })
-        second = policy.predict_action({
+        policy.p1_online_store_full_diffusion_trace = True
+        policy.p1_training_progress.fill_(1.0)
+
+        history_symbols = []
+        history_outputs = []
+        original_history = policy.p1_model.history.forward
+
+        def recording_history(*args, **kwargs):
+            output = original_history(*args, **kwargs)
+            history_symbols.append(kwargs.get("oracle_symbol"))
+            history_outputs.append(output.detach().clone())
+            return output
+
+        policy.p1_model.history.forward = recording_history
+        first_obs = {"state": torch.randn(1, 2, 5)}
+        if mode == "oracle_gate_symbol":
+            first_obs["oracle_symbol"] = torch.tensor([2])
+
+        first = policy.predict_action(first_obs)
+        first_action_time = policy.last_online_probe["action_time"]
+        first_physical_time = policy.last_online_probe["physical_time"]
+        first_committed_action_time = policy.last_online_probe[
+            "last_committed_action_time"]
+        first_committed_physical_time = policy.last_online_probe[
+            "committed_physical_time"]
+        first_carry = {
+            timestep: latent.clone()
+            for timestep, latent in policy._p1_online_carry_by_timestep.items()
+        }
+        second_obs = {
             "state": torch.randn(1, 2, 5),
             "past_action": first["action"][:, -1:],
-        })
+        }
+        if mode == "oracle_gate_symbol":
+            second_obs["oracle_symbol"] = torch.tensor([3])
+        second = policy.predict_action(second_obs)
 
         assert first["action"].shape == (1, 1, 3)
         assert second["action"].shape == (1, 1, 3)
+        assert len(history_outputs) == 2
+        if mode == "oracle_gate_symbol":
+            torch.testing.assert_close(
+                history_symbols[0], torch.tensor([[2]]))
+            torch.testing.assert_close(
+                history_symbols[1], torch.tensor([[2, 3]]))
+        else:
+            assert history_symbols == [None, None]
+
+        assert first_action_time == [0, 1, 2, 3, 4]
+        assert first_physical_time == [1, 2, 3, 4, 5]
+        assert first_committed_action_time == 0
+        assert first_committed_physical_time == 1
+        assert policy.last_online_probe["action_time"] == [1, 2, 3, 4, 5]
+        assert policy.last_online_probe["physical_time"] == [2, 3, 4, 5, 6]
+        assert policy.last_online_probe["last_committed_action_time"] == 1
+        assert policy.last_online_probe["committed_physical_time"] == 2
         assert policy._p1_online_history_feature.shape[1] == 2
+        assert policy._p1_online_history_action.shape[1] == 2
+        assert policy.last_online_probe["carry_ratio"] == 0.5
+        assert len(policy.last_online_probe["diffusion_trace"]) == 2
+        history_start = history_outputs[1][:, -1]
+        for row in policy.last_online_probe["diffusion_trace"]:
+            expected = 0.5 * first_carry[row["timestep"]] + 0.5 * history_start
+            actual = torch.tensor(row["initial_z"])
+            torch.testing.assert_close(actual, expected)
         assert len(policy.last_online_probe["probability"]) == policy.horizon - 1
+        assert len(policy.last_online_probe["z"]) == policy.horizon
+        assert len(policy.last_online_probe["total_delta_norm"]) == policy.horizon - 1
+        assert len(policy.last_online_probe["d_flow"]) == policy.horizon - 1
+        assert len(policy.last_online_probe["d_jump"]) == policy.horizon - 1
+        assert policy.last_online_probe["d_consistency"] is not None
+        assert policy.last_online_probe["full_diffusion_trace_stored"] is True
         assert all(
             0 <= value <= 1
             for value in policy.last_online_probe["probability"]
         )
+
+
+def test_cached_feature_window_conditions_dit_but_updates_history_causally():
+    policy = make_policy("main")
+    policy.eval()
+    policy.n_action_steps = 1
+    policy.reset()
+    history_features = []
+    condition_windows = []
+    original_update = policy._p1_update_online_history
+
+    def recording_update(feature, previous_action, oracle_symbol):
+        history_features.append(feature.detach().clone())
+        return original_update(feature, previous_action, oracle_symbol)
+
+    def recording_sample(condition_data, condition_mask, condition, initial_z, oracle_symbol):
+        condition_windows.append(condition.detach().clone())
+        return torch.zeros_like(condition_data)
+
+    policy._p1_update_online_history = recording_update
+    policy._p1_online_conditional_sample = recording_sample
+    feature_window = torch.tensor([[[1., 2., 3., 4., 5.],
+                                    [6., 7., 8., 9., 10.]]])
+
+    result = policy.predict_action_from_cached_feature(feature_window)
+
+    assert result["action"].shape == (1, 1, 3)
+    torch.testing.assert_close(condition_windows[0], feature_window)
+    torch.testing.assert_close(history_features[0], feature_window[:, -1:])
+    assert policy._p1_online_history_feature.shape[1] == 1
+
+
+def test_oracle_online_inference_requires_causal_symbol():
+    policy = make_policy("oracle_gate_symbol")
+    policy.eval()
+    policy.n_action_steps = 1
+    policy.num_inference_steps = 1
+    with pytest.raises(ValueError, match="requires the causal current"):
+        policy.predict_action({"state": torch.randn(1, 2, 5)})
+
+
+def test_online_p1_inference_requires_explicit_episode_length():
+    policy = make_policy("main", p1_online_episode_length=None)
+    policy.eval()
+    policy.n_action_steps = 1
+    policy.num_inference_steps = 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires an explicit.*episode length",
+    ):
+        policy.predict_action({"state": torch.randn(1, 2, 5)})
+
+
+def test_online_probe_defaults_to_compact_diffusion_trace():
+    policy = make_policy("main")
+    policy.eval()
+    policy.n_action_steps = 1
+    policy.num_inference_steps = 2
+    policy.predict_action({"state": torch.randn(1, 2, 5)})
+
+    assert policy.last_online_probe["full_diffusion_trace_stored"] is False
+    assert len(policy.last_online_probe["diffusion_trace"]) == 2
+    assert all(
+        set(row) == {"timestep", "normalized_tau", "d_consistency"}
+        for row in policy.last_online_probe["diffusion_trace"]
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from diffusion_policy.model.p1.group import P1GroupOutput
@@ -20,6 +21,8 @@ class EdgeBalancedBCEOutput:
     edge_time: Tensor
     positive_count: int
     negative_count: int
+    global_positive_count: int
+    global_negative_count: int
     metric_update_valid: bool
 
 
@@ -33,6 +36,79 @@ class P1GroupLossOutput:
     edge: EdgeBalancedBCEOutput
 
 
+def _edge_balanced_loss_from_sums(
+    *,
+    per_edge: Tensor,
+    positive_sum: Tensor,
+    negative_sum: Tensor,
+    positive_count: int,
+    negative_count: int,
+    ddp_local_group_count: Tensor | None,
+) -> tuple[Tensor, int, int]:
+    """Return the rank contribution for one globally balanced DDP BCE."""
+    if ddp_local_group_count is None:
+        if positive_count and negative_count:
+            loss = (
+                0.5 * positive_sum / positive_count
+                + 0.5 * negative_sum / negative_count
+            )
+        elif positive_count:
+            loss = positive_sum / positive_count
+        elif negative_count:
+            loss = negative_sum / negative_count
+        else:
+            loss = per_edge.sum() * 0
+        return loss, positive_count, negative_count
+
+    local_group_count = torch.as_tensor(
+        ddp_local_group_count,
+        device=per_edge.device,
+        dtype=torch.float64,
+    )
+    if local_group_count.numel() != 1:
+        raise ValueError("ddp_local_group_count must be a scalar")
+    if not bool(torch.isfinite(local_group_count)) \
+            or bool(local_group_count < 0):
+        raise ValueError(
+            "ddp_local_group_count must be finite and non-negative")
+    if per_edge.numel() and not bool(local_group_count > 0):
+        raise ValueError("valid real edges require a positive local group count")
+
+    summary = torch.stack((
+        per_edge.new_tensor(float(positive_count), dtype=torch.float64),
+        per_edge.new_tensor(float(negative_count), dtype=torch.float64),
+        local_group_count,
+    ))
+    global_summary = summary.clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(global_summary, op=dist.ReduceOp.SUM)
+    global_positive_count = int(global_summary[0].item())
+    global_negative_count = int(global_summary[1].item())
+    global_group_count = global_summary[2]
+
+    if global_positive_count and global_negative_count:
+        local_class_contribution = (
+            0.5 * positive_sum / global_positive_count
+            + 0.5 * negative_sum / global_negative_count
+        )
+    elif global_positive_count:
+        local_class_contribution = positive_sum / global_positive_count
+    elif global_negative_count:
+        local_class_contribution = negative_sum / global_negative_count
+    else:
+        local_class_contribution = per_edge.sum() * 0
+
+    if bool(local_group_count > 0):
+        scale = (global_group_count / local_group_count).to(
+            dtype=local_class_contribution.dtype)
+        loss = local_class_contribution * scale
+    else:
+        # Every rank must enter the collective even when it has only dummy
+        # groups. Keep a differentiable zero so DDP sees the same graph.
+        loss = (positive_sum + negative_sum) * 0
+    return loss, global_positive_count, global_negative_count
+
+
 def edge_balanced_bce_from_intensity_views(
     *,
     intensity: Tensor,
@@ -42,8 +118,16 @@ def edge_balanced_bce_from_intensity_views(
     valid_mask: Tensor | None = None,
     delta_seconds: float = 0.05,
     epsilon: float = 1e-6,
+    ddp_local_group_count: Tensor | None = None,
 ) -> EdgeBalancedBCEOutput:
-    """Average intensity views by (episode, edge start), then balance real edges."""
+    """Average duplicate views, then balance real edges by global DDP class.
+
+    ``ddp_local_group_count`` enables the training workspace contract where DDP
+    later weights the complete local loss by the rank's number of real groups.
+    This function all-reduces class and group counts and returns a local boundary
+    contribution that cancels that outer weighting. DDP's gradient mean then
+    equals a single process over the union of all rank-local real edges.
+    """
     tensors = (intensity, target, episode_id, edge_time)
     if any(value.ndim != 1 for value in tensors):
         raise ValueError("intensity, target, episode_id, and edge_time must be 1-D")
@@ -63,21 +147,6 @@ def edge_balanced_bce_from_intensity_views(
     selected_target = target[valid_mask].to(dtype=intensity.dtype)
     selected_episode = episode_id[valid_mask].to(dtype=torch.int64)
     selected_time = edge_time[valid_mask].to(dtype=torch.int64)
-    if selected_intensity.numel() == 0:
-        empty_float = intensity.new_empty((0,))
-        empty_long = episode_id.new_empty((0,), dtype=torch.int64)
-        return EdgeBalancedBCEOutput(
-            loss=intensity.sum() * 0,
-            edge_intensity=empty_float,
-            edge_probability=empty_float,
-            edge_target=empty_float,
-            edge_episode=empty_long,
-            edge_time=empty_long,
-            positive_count=0,
-            negative_count=0,
-            metric_update_valid=False,
-        )
-
     keys = torch.stack((selected_episode, selected_time), dim=1)
     unique_keys, inverse = torch.unique(keys, dim=0, sorted=True, return_inverse=True)
     edge_count = unique_keys.shape[0]
@@ -102,12 +171,17 @@ def edge_balanced_bce_from_intensity_views(
     negative = ~positive
     positive_count = int(positive.sum().item())
     negative_count = int(negative.sum().item())
-    if positive_count and negative_count:
-        loss = 0.5 * per_edge[positive].mean() + 0.5 * per_edge[negative].mean()
-    elif positive_count:
-        loss = per_edge[positive].mean()
-    else:
-        loss = per_edge[negative].mean()
+    positive_sum = per_edge[positive].sum()
+    negative_sum = per_edge[negative].sum()
+    loss, global_positive_count, global_negative_count = (
+        _edge_balanced_loss_from_sums(
+            per_edge=per_edge,
+            positive_sum=positive_sum,
+            negative_sum=negative_sum,
+            positive_count=positive_count,
+            negative_count=negative_count,
+            ddp_local_group_count=ddp_local_group_count,
+        ))
 
     return EdgeBalancedBCEOutput(
         loss=loss,
@@ -118,7 +192,9 @@ def edge_balanced_bce_from_intensity_views(
         edge_time=unique_keys[:, 1],
         positive_count=positive_count,
         negative_count=negative_count,
-        metric_update_valid=True,
+        global_positive_count=global_positive_count,
+        global_negative_count=global_negative_count,
+        metric_update_valid=edge_count > 0,
     )
 
 
@@ -177,6 +253,7 @@ def compute_p1_group_losses(
         edge_time=(physical_time[:, :, :-1] + 1).reshape(-1),
         valid_mask=edge_valid.reshape(-1),
         delta_seconds=delta_seconds,
+        ddp_local_group_count=group_valid.sum(dtype=torch.float64),
     )
 
     if not 0 < stride < window:

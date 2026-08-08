@@ -21,7 +21,12 @@ from pathlib import Path
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
+from diffusion_policy.env_runner.p1_rollout_trace import (
+    P1RolloutTraceWriter, committed_first_edge,
+)
+from diffusion_policy.env.robomimic.seeded_robomimic_image_wrapper import (
+    SeededRobomimicImageWrapper,
+)
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -85,6 +90,13 @@ class RobomimicImageRunner(BaseImageRunner):
         # disable object state observation
         self.env_kwargs = OmegaConf.to_container(env_kwargs) if env_kwargs is not None else {}
         env_name = self.env_kwargs["env_name"]
+        reset_mode = self.env_kwargs.get("reset_mode", "generated_seed")
+        if reset_mode not in {"generated_seed", "demonstration_state"}:
+            raise ValueError(f"Unsupported rollout reset mode: {reset_mode}")
+        episode_root = self.env_kwargs.get("episode_root")
+        initial_state_index = int(self.env_kwargs.get("initial_state_index", 0))
+        if reset_mode == "demonstration_state" and not episode_root:
+            raise ValueError("demonstration_state rollout requires episode_root")
 
         rotation_transformer = None
         if abs_action:
@@ -92,12 +104,13 @@ class RobomimicImageRunner(BaseImageRunner):
 
         def env_fn(env_i):
             # set seed for env appropriately
-            if "seed" in self.env_kwargs:
-                self.env_kwargs["seed"] += env_i
+            env_seed = self.env_kwargs.get("seed", None)
+            if env_seed is not None:
+                env_seed += env_i
             robocasa_env = create_env(
                 split=self.env_kwargs["split"], 
                 env_name=self.env_kwargs["env_name"],
-                seed=self.env_kwargs.get("seed", None)
+                seed=env_seed,
             )
             # Robosuite's hard reset causes excessive memory consumption.
             # Disabled to run more envs.
@@ -105,7 +118,7 @@ class RobomimicImageRunner(BaseImageRunner):
             # robocasa_env.env.hard_reset = False
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    SeededRobomimicImageWrapper(
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -139,7 +152,7 @@ class RobomimicImageRunner(BaseImageRunner):
             )
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    SeededRobomimicImageWrapper(
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -173,7 +186,8 @@ class RobomimicImageRunner(BaseImageRunner):
             seed = test_start_seed + i
             enable_render = i < n_test_vis
 
-            def init_fn(env, seed=seed, 
+            def init_fn(env, seed=seed, reset_mode=reset_mode,
+                episode_root=episode_root, initial_state_index=initial_state_index,
                 enable_render=enable_render):
                 # setup rendering
                 # video_wrapper
@@ -187,10 +201,13 @@ class RobomimicImageRunner(BaseImageRunner):
                     filename = str(filename)
                     env.env.file_path = filename
 
-                # switch to seed reset
-                assert isinstance(env.env.env, RobomimicImageWrapper)
-                env.env.env.init_state = None
-                # env.seed(seed)
+                # Select exactly one reset source for the next reset.
+                assert isinstance(env.env.env, SeededRobomimicImageWrapper)
+                if reset_mode == "demonstration_state":
+                    env.env.env.set_reset_snapshot(
+                        episode_root, state_index=initial_state_index)
+                else:
+                    env.env.env.set_reset_seed(seed)
 
             env_seeds.append(seed)
             env_prefixs.append('test/')
@@ -216,11 +233,20 @@ class RobomimicImageRunner(BaseImageRunner):
         self.rotation_transformer = rotation_transformer
         self.abs_action = abs_action
         self.tqdm_interval_sec = tqdm_interval_sec
+        self.reset_mode = reset_mode
+        self.episode_root = episode_root
+        self.initial_state_index = initial_state_index
+        # Set by the rollout worker only for offline-reference Oracle evaluation.
+        self.p1_oracle_subtask_idx = None
+        self.p1_trace_metadata = None
 
     def run(self, policy: BaseImagePolicy):
         device = policy.device
         dtype = policy.dtype
         env = self.env
+        reset_mode = self.reset_mode
+        episode_root = self.episode_root
+        initial_state_index = self.initial_state_index
         
         # plan for rollout
         n_envs = len(self.env_fns)
@@ -230,6 +256,15 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        is_p1 = bool(getattr(policy, "is_p1_latent", False))
+        if is_p1 and (n_envs != 1 or self.n_action_steps != 1):
+            raise RuntimeError("P1 committed trace requires n_envs=1 and n_action_steps=1")
+        oracle_sequence = self.p1_oracle_subtask_idx
+        trace_writer = (
+            P1RolloutTraceWriter(self.output_dir, self.p1_trace_metadata or {})
+            if is_p1 else None
+        )
+        physical_step = 0
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -261,6 +296,11 @@ class RobomimicImageRunner(BaseImageRunner):
             while not done:
                 # create obs dict
                 np_obs_dict = dict(obs)
+                if oracle_sequence is not None:
+                    if physical_step >= len(oracle_sequence):
+                        raise RuntimeError("offline Oracle sequence exhausted during rollout")
+                    np_obs_dict['oracle_symbol'] = np.asarray(
+                        [oracle_sequence[physical_step]], dtype=np.int64)
                 if self.past_action and (past_action is not None):
                     # TODO: not tested
                     np_obs_dict['past_action'] = past_action[
@@ -297,11 +337,21 @@ class RobomimicImageRunner(BaseImageRunner):
 
                 # # Concatenate along the last axis (axis=-1)
                 # env_action = np.concatenate([env_action, base_ac_expanded], axis=-1)
+                if trace_writer is not None:
+                    oracle_idx = (
+                        int(oracle_sequence[physical_step])
+                        if oracle_sequence is not None else None
+                    )
+                    trace_writer.append(committed_first_edge(
+                        policy.last_online_probe, action[0, 0], env_action[0, 0],
+                        oracle_subtask_idx=oracle_idx,
+                    ))
                 obs, reward, done, info = env.step(env_action)
                 # done = np.all(done)
                 # for robocasa switch to the proper success check
                 done = np.all(done) or np.all([this_info["success"][0] for this_info in info])
                 past_action = action
+                physical_step += action.shape[1]
 
                 # update pbar
                 pbar.update(action.shape[1])
@@ -316,6 +366,15 @@ class RobomimicImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
+        if trace_writer is not None:
+            log_data.update(trace_writer.finalize())
+        log_data['evaluation/reset_mode'] = reset_mode
+        log_data['evaluation/environment_seeds'] = (
+            list(self.env_seeds) if reset_mode == "generated_seed" else [])
+        log_data['evaluation/explicit_seed_reset'] = reset_mode == "generated_seed"
+        if reset_mode == "demonstration_state":
+            log_data['evaluation/episode_root'] = str(episode_root)
+            log_data['evaluation/initial_state_index'] = initial_state_index
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
         # fortunately this won't invalidate our conclusion since
@@ -328,16 +387,19 @@ class RobomimicImageRunner(BaseImageRunner):
         print(f"Success rate: {success_rate}")
         for i in range(n_inits):
             seed = self.env_seeds[i]
+            result_id = (
+                seed if reset_mode == "generated_seed"
+                else Path(episode_root).name)
             prefix = self.env_prefixs[i]
             max_reward = np.max(all_rewards[i])
             max_rewards[prefix].append(max_reward)
-            log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+            log_data[prefix+f'sim_max_reward_{result_id}'] = max_reward
 
             # visualize sim
             video_path = all_video_paths[i]
             if video_path is not None:
                 sim_video = wandb.Video(video_path, format="mp4")
-                log_data[prefix+f'sim_video_{seed}'] = sim_video
+                log_data[prefix+f'sim_video_{result_id}'] = sim_video
         env_name = self.env_kwargs["env_name"]
         log_data[f'success_rate/{env_name}'] = success_rate
         # log aggregate metrics

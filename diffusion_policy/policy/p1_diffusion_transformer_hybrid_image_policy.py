@@ -65,8 +65,10 @@ class P1DiffusionTransformerHybridImagePolicy(
             p1_beta_overlap_max: float = 0.05,
             p1_teacher_force_until: float = 0.40,
             p1_teacher_force_end: float = 0.60,
-            p1_online_episode_length: int = 600,
+            p1_online_episode_length: int | None = None,
+            p1_online_store_full_diffusion_trace: bool = False,
             p1_train_obs_encoder: bool = True,
+            p1_dit_trainable: bool = False,
             **kwargs,
         ):
         super().__init__(*args, **kwargs)
@@ -77,11 +79,20 @@ class P1DiffusionTransformerHybridImagePolicy(
         self.p1_beta_overlap_max = float(p1_beta_overlap_max)
         self.p1_teacher_force_until = float(p1_teacher_force_until)
         self.p1_teacher_force_end = float(p1_teacher_force_end)
-        self.p1_online_episode_length = int(p1_online_episode_length)
+        self.p1_online_episode_length = (
+            None
+            if p1_online_episode_length is None
+            else int(p1_online_episode_length)
+        )
+        self.p1_online_store_full_diffusion_trace = bool(
+            p1_online_store_full_diffusion_trace)
         self.p1_train_obs_encoder = bool(p1_train_obs_encoder)
-        if self.p1_online_episode_length < 2:
+        self.p1_dit_trainable = bool(p1_dit_trainable)
+        if (
+            self.p1_online_episode_length is not None
+            and self.p1_online_episode_length < 2
+        ):
             raise ValueError("p1_online_episode_length must be at least 2")
-
 
         if not (
             0 <= self.p1_teacher_force_until
@@ -164,16 +175,22 @@ class P1DiffusionTransformerHybridImagePolicy(
 
     def _freeze_pretrained_backbone(self) -> None:
         self.obs_encoder.requires_grad_(False)
-        self.model.requires_grad_(False)
+        self.model.requires_grad_(self.p1_dit_trainable)
         self.obs_encoder.eval()
-        self.model.eval()
+        if not self.p1_dit_trainable:
+            self.model.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.is_p1_latent:
-            # Frozen dropout/crop behavior must not drift during P1 training.
+            # Cached observation features keep the encoder frozen. DiT dropout
+            # follows the requested unfreeze mode; the legacy latent-only path
+            # keeps the pretrained backbone in eval mode.
             self.obs_encoder.eval()
-            self.model.eval()
+            if self.p1_dit_trainable:
+                self.model.train(mode)
+            else:
+                self.model.eval()
             if self.p1_model is not None:
                 self.p1_model.train(mode)
         return self
@@ -214,8 +231,17 @@ class P1DiffusionTransformerHybridImagePolicy(
     def trainable_parameter_audit(self) -> dict[str, Any]:
         names = [name for name, parameter in self.named_parameters()
                  if parameter.requires_grad]
+        dit_count = sum(
+            parameter.numel() for parameter in self.model.parameters()
+            if parameter.requires_grad)
+        p1_count = sum(
+            parameter.numel() for parameter in self.p1_model.parameters()
+            if parameter.requires_grad) if self.p1_model is not None else 0
         return {
             "mode": self.p1_mode.value,
+            "p1_dit_trainable": self.p1_dit_trainable,
+            "dit_trainable_parameter_count": dit_count,
+            "p1_trainable_parameter_count": p1_count,
             "trainable_parameter_count": sum(
                 parameter.numel() for parameter in self.parameters()
                 if parameter.requires_grad),
@@ -226,9 +252,26 @@ class P1DiffusionTransformerHybridImagePolicy(
         }
 
     def load_pretrained_backbone(self, state_dict: dict[str, Tensor]) -> None:
-        """Strictly validate base keys while allowing only new P1 keys to be absent."""
-        incompatible = self.load_state_dict(state_dict, strict=False)
-        allowed_missing_prefixes = ("p1_model.", "p1_training_progress")
+        """Load foundation weights without importing their data normalizer."""
+        normalizer_state = {
+            key: value.detach().clone()
+            for key, value in self.normalizer.state_dict().items()
+        }
+        backbone_state = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("normalizer.")
+        }
+        incompatible = self.load_state_dict(backbone_state, strict=False)
+        # DictOfTensorMixin reconstructs its dynamic ParameterDict on every
+        # parent load, including a load with no normalizer keys. Restore the
+        # caller-selected transform after loading the foundation backbone.
+        self.normalizer.load_state_dict(normalizer_state)
+        allowed_missing_prefixes = (
+            "normalizer.",
+            "p1_model.",
+            "p1_training_progress",
+        )
         invalid_missing = [
             key for key in incompatible.missing_keys
             if not key.startswith(allowed_missing_prefixes)
@@ -246,6 +289,7 @@ class P1DiffusionTransformerHybridImagePolicy(
             learning_rate: float,
             betas: Tuple[float, float],
             p1_weight_decay: float = 1.0e-3,
+            dit_learning_rate: float | None = None,
         ) -> torch.optim.Optimizer:
         if self.p1_mode is P1ExperimentMode.BASELINE:
             return super().get_optimizer(
@@ -254,15 +298,30 @@ class P1DiffusionTransformerHybridImagePolicy(
                 learning_rate=learning_rate,
                 betas=betas,
             )
-        parameters = [
-            parameter for parameter in self.parameters() if parameter.requires_grad]
-        if not parameters:
+        groups = []
+        if self.p1_dit_trainable:
+            dit_lr = float(dit_learning_rate if dit_learning_rate is not None else learning_rate)
+            for group in self.model.get_optim_groups(transformer_weight_decay):
+                params = [p for p in group["params"] if p.requires_grad]
+                if params:
+                    groups.append({
+                        "params": params,
+                        "weight_decay": group["weight_decay"],
+                        "lr": dit_lr,
+                    })
+        p1_params = [
+            parameter for parameter in self.p1_model.parameters()
+            if parameter.requires_grad
+        ] if self.p1_model is not None else []
+        if p1_params:
+            groups.append({
+                "params": p1_params,
+                "weight_decay": p1_weight_decay,
+                "lr": learning_rate,
+            })
+        if not groups:
             raise RuntimeError("P1 latent experiment has no trainable parameters")
-        return torch.optim.AdamW(
-            [{"params": parameters, "weight_decay": p1_weight_decay}],
-            lr=learning_rate,
-            betas=betas,
-        )
+        return torch.optim.AdamW(groups, betas=betas)
 
     @staticmethod
     def _shared_group_noise(action: Tensor, physical_time: Tensor) -> Tensor:
@@ -418,13 +477,21 @@ class P1DiffusionTransformerHybridImagePolicy(
 
         if self.p1_model is None:
             raise AssertionError("latent mode requires p1_model")
-        with torch.no_grad():
+        if self.p1_dit_trainable:
             split_state = self.model.forward_decoder_pre(
                 noisy_action,
                 flat_timestep,
                 flat_condition,
                 split_layer=self.p1_split_layer,
             )
+        else:
+            with torch.no_grad():
+                split_state = self.model.forward_decoder_pre(
+                    noisy_action,
+                    flat_timestep,
+                    flat_condition,
+                    split_layer=self.p1_split_layer,
+                )
         hidden = split_state.hidden.reshape(
             batch_size, windows, window, -1)
         carry_ratio, beta_overlap, teacher_ratio = self.schedule_values()
@@ -550,6 +617,7 @@ class P1DiffusionTransformerHybridImagePolicy(
         self.last_probe_rows = [
             {
                 "episode_id": int(episode),
+                "action_time": int(time) - 1,
                 "physical_time": int(time),
                 "probability": float(p),
                 "intensity": float(lam),
@@ -592,19 +660,10 @@ class P1DiffusionTransformerHybridImagePolicy(
         if boundary_target.shape != (episode_length,):
             raise ValueError("boundary_target must have shape [T]")
 
-        valid = torch.ones((1, 1), device=feature.device, dtype=torch.bool)
-        history_symbol = (
-            subtask_idx[None, :1]
-            if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL
-            else None
-        )
-        history_latent = self.p1_model.history(
-            feature=feature[None, :1],
-            previous_action=self.normalizer["action"].normalize(previous_action[:1])[None],
-            valid_mask=valid,
-            oracle_symbol=history_symbol,
-        )
-        current = history_latent[:, 0]
+        self.reset()
+        carry_ratio, _, _ = self.schedule_values()
+        current: Tensor | None = None
+
         timestep = torch.full(
             (1,), int(diffusion_timestep), device=feature.device, dtype=torch.long)
         normalized_tau = timestep.to(feature.dtype) / max(
@@ -614,6 +673,27 @@ class P1DiffusionTransformerHybridImagePolicy(
         rows: list[dict[str, float | int]] = []
 
         for edge_start in range(episode_length - 1):
+            history_symbol = (
+                subtask_idx[edge_start:edge_start + 1]
+                if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL
+                else None
+            )
+            past_action = (
+                None
+                if edge_start == 0
+                else self.normalizer["action"].normalize(
+                    previous_action[edge_start:edge_start + 1])
+            )
+            history_start = self._p1_update_online_history(
+                feature[None, edge_start:edge_start + 1],
+                past_action,
+                history_symbol,
+            )
+            initial_z = (
+                history_start
+                if current is None
+                else carry_ratio * current + (1 - carry_ratio) * history_start
+            )
             condition = feature[edge_start:edge_start + 2][None]
             context = condition.reshape(1, -1)
             clean_action = normalized_action[edge_start:edge_start + 1]
@@ -639,7 +719,7 @@ class P1DiffusionTransformerHybridImagePolicy(
                 + torch.arange(1, self.horizon, device=feature.device)
             ).to(feature.dtype).div(denominator).clamp_max(1)[None]
             dynamics = self.p1_model.dynamics(
-                initial_z=current,
+                initial_z=initial_z,
                 hidden=split_state.hidden,
                 context=context,
                 normalized_tau=normalized_tau,
@@ -652,11 +732,13 @@ class P1DiffusionTransformerHybridImagePolicy(
             # Commit only t -> t+1. Candidate edges t+1: are discarded.
             current = dynamics.z[:, 1]
             rows.append({
+                "action_time": edge_start,
                 "physical_time": edge_start + 1,
                 "probability": float(dynamics.probability[0, 0]),
                 "intensity": float(dynamics.intensity[0, 0]),
                 "target": float(boundary_target[edge_start + 1]),
             })
+        self.reset()
         return rows
 
     def compute_loss(self, batch: Dict[str, Any]):
@@ -670,13 +752,22 @@ class P1DiffusionTransformerHybridImagePolicy(
     def reset(self) -> None:
         self._p1_online_history_feature: Tensor | None = None
         self._p1_online_history_action: Tensor | None = None
+        self._p1_online_history_symbol: Tensor | None = None
+        self._p1_online_carry_by_timestep: dict[int, Tensor] = {}
         self.last_online_probe = {}
 
     def _p1_encode_online_condition(
             self, obs_dict: Dict[str, Tensor]
-        ) -> tuple[Tensor, Tensor | None]:
+        ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         raw = dict(obs_dict)
         past_action = raw.pop("past_action", None)
+        oracle_symbol = raw.pop("oracle_symbol", None)
+        subtask_idx = raw.pop("subtask_idx", None)
+        if oracle_symbol is not None and subtask_idx is not None:
+            raise ValueError("provide only one of oracle_symbol or subtask_idx")
+        if oracle_symbol is None:
+            oracle_symbol = subtask_idx
+
         normalized = self.normalizer.normalize(raw)
         if not normalized:
             raise ValueError("P1 online inference requires observations")
@@ -691,6 +782,7 @@ class P1DiffusionTransformerHybridImagePolicy(
         )
         feature = self.obs_encoder(current).reshape(
             batch, self.n_obs_steps, self.obs_feature_dim)
+
         if past_action is not None:
             if past_action.ndim != 3 or past_action.shape[0] != batch:
                 raise ValueError("past_action must have shape [B,L,action_dim]")
@@ -698,13 +790,34 @@ class P1DiffusionTransformerHybridImagePolicy(
                 raise ValueError("past_action action_dim does not match policy")
             past_action = self.normalizer["action"].normalize(
                 past_action[:, -1]).to(dtype=feature.dtype)
-        return feature, past_action
+
+        if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL:
+            if oracle_symbol is None:
+                raise ValueError(
+                    "oracle_gate_symbol online inference requires the causal "
+                    "current oracle_symbol (or subtask_idx)"
+                )
+            oracle_symbol = torch.as_tensor(
+                oracle_symbol, device=feature.device)
+            if oracle_symbol.ndim == 2:
+                oracle_symbol = oracle_symbol[:, -1]
+            elif oracle_symbol.ndim != 1:
+                raise ValueError("oracle_symbol must have shape [B] or [B,L]")
+            if oracle_symbol.shape != (batch,):
+                raise ValueError(
+                    "oracle_symbol batch dimension does not match observations")
+            oracle_symbol = oracle_symbol.to(dtype=torch.long)
+        else:
+            oracle_symbol = None
+        return feature, past_action, oracle_symbol
 
     def _p1_update_online_history(
             self,
             feature: Tensor,
             past_action: Tensor | None,
+            oracle_symbol: Tensor | None,
         ) -> Tensor:
+        """Encode the same causal feature/action/symbol prefix used in training."""
         if self.p1_model is None:
             raise AssertionError("P1 online history requires p1_model")
         latest = feature[:, -1:].detach()
@@ -713,6 +826,8 @@ class P1DiffusionTransformerHybridImagePolicy(
             previous = latest.new_zeros((batch, self.action_dim))
             self._p1_online_history_feature = latest
             self._p1_online_history_action = previous[:, None]
+            if oracle_symbol is not None:
+                self._p1_online_history_symbol = oracle_symbol[:, None]
         else:
             if past_action is None:
                 raise RuntimeError(
@@ -724,6 +839,16 @@ class P1DiffusionTransformerHybridImagePolicy(
                 (self._p1_online_history_feature, latest), dim=1)
             self._p1_online_history_action = torch.cat(
                 (self._p1_online_history_action, past_action[:, None]), dim=1)
+            if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL:
+                if oracle_symbol is None:
+                    raise AssertionError("Oracle symbol validation was bypassed")
+                if self._p1_online_history_symbol is None:
+                    raise AssertionError("Oracle history symbol was not initialized")
+                self._p1_online_history_symbol = torch.cat(
+                    (self._p1_online_history_symbol, oracle_symbol[:, None]),
+                    dim=1,
+                )
+
         valid = torch.ones(
             self._p1_online_history_feature.shape[:2],
             device=feature.device,
@@ -733,7 +858,7 @@ class P1DiffusionTransformerHybridImagePolicy(
             feature=self._p1_online_history_feature,
             previous_action=self._p1_online_history_action,
             valid_mask=valid,
-            oracle_symbol=None,
+            oracle_symbol=self._p1_online_history_symbol,
         )
         return latent[:, -1]
 
@@ -743,6 +868,7 @@ class P1DiffusionTransformerHybridImagePolicy(
             condition_mask: Tensor,
             condition: Tensor,
             initial_z: Tensor,
+            oracle_symbol: Tensor | None,
             generator=None,
         ) -> Tensor:
         if self.p1_model is None:
@@ -759,6 +885,11 @@ class P1DiffusionTransformerHybridImagePolicy(
         context = condition.reshape(batch, -1)
         if self._p1_online_history_feature is None:
             raise AssertionError("P1 online history was not initialized")
+        if self.p1_online_episode_length is None:
+            raise RuntimeError(
+                "P1 online sampling requires an explicit "
+                "time-normalization episode length"
+            )
         current_time = self._p1_online_history_feature.shape[1] - 1
         denominator = max(self.p1_online_episode_length - 1, 1)
         normalized_next_time = (
@@ -772,7 +903,17 @@ class P1DiffusionTransformerHybridImagePolicy(
         ) / denominator
         normalized_next_time = normalized_next_time.clamp_max(1).expand(
             batch, -1)
+
         latest_dynamics = None
+        latest_consistency: Tensor | None = None
+        diffusion_trace: list[dict[str, Any]] = []
+        next_carry: dict[int, Tensor] = {}
+        dynamics_oracle = (
+            self.p1_model.history.oracle_embedding(oracle_symbol)
+            if oracle_symbol is not None
+            else None
+        )
+        carry_ratio, _, _ = self.schedule_values()
         for timestep in scheduler.timesteps:
             trajectory[condition_mask] = condition_data[condition_mask]
             split_state = self.model.forward_decoder_pre(
@@ -785,8 +926,18 @@ class P1DiffusionTransformerHybridImagePolicy(
                 timestep,
                 device=trajectory.device,
             ).expand(batch).long()
+            timestep_key = int(batch_timestep[0].item())
+            carry = self._p1_online_carry_by_timestep.get(timestep_key)
+            consistency = (
+                None if carry is None else (carry - initial_z).norm(dim=-1))
+            step_initial_z = (
+                initial_z
+                if carry is None
+                else carry_ratio * carry + (1 - carry_ratio) * initial_z
+            )
+            latest_consistency = consistency
             latest_dynamics = self.p1_model.dynamics(
-                initial_z=initial_z,
+                initial_z=step_initial_z,
                 hidden=split_state.hidden,
                 context=context,
                 normalized_tau=(
@@ -794,7 +945,7 @@ class P1DiffusionTransformerHybridImagePolicy(
                     / max(self.p1_model.group_config.num_diffusion_steps - 1, 1)
                 ),
                 normalized_next_time=normalized_next_time,
-                oracle=None,
+                oracle=dynamics_oracle,
                 boundary_target=None,
                 teacher_ratio=0.0,
             )
@@ -811,20 +962,160 @@ class P1DiffusionTransformerHybridImagePolicy(
                 generator=generator,
                 **self.kwargs,
             ).prev_sample
+
+            commit_edges = self.n_action_steps
+            if commit_edges >= latest_dynamics.z.shape[1]:
+                raise RuntimeError("n_action_steps exceeds the latent horizon")
+            next_carry[timestep_key] = latest_dynamics.z[
+                :, commit_edges].detach()
+            trace_row: dict[str, Any] = {
+                "timestep": timestep_key,
+                "normalized_tau": (
+                    timestep_key
+                    / max(self.p1_model.group_config.num_diffusion_steps - 1, 1)
+                ),
+                "d_consistency": (
+                    None if consistency is None
+                    else consistency.detach().cpu().tolist()
+                ),
+            }
+            if self.p1_online_store_full_diffusion_trace:
+                step_total_delta = (
+                    latest_dynamics.z[:, 1:] - latest_dynamics.z[:, :-1]
+                )
+                step_applied_jump_delta = (
+                    latest_dynamics.gate.unsqueeze(-1)
+                    * latest_dynamics.jump_delta
+                )
+                trace_row.update({
+                    "initial_z": step_initial_z.detach().cpu().tolist(),
+                    "z": latest_dynamics.z.detach().cpu().tolist(),
+                    "z_minus": (
+                        latest_dynamics.z_minus.detach().cpu().tolist()),
+                    "flow_delta": (
+                        latest_dynamics.flow_delta.detach().cpu().tolist()),
+                    "jump_delta": (
+                        latest_dynamics.jump_delta.detach().cpu().tolist()),
+                    "probability": (
+                        latest_dynamics.probability.detach().cpu().tolist()),
+                    "intensity": (
+                        latest_dynamics.intensity.detach().cpu().tolist()),
+                    "gate": latest_dynamics.gate.detach().cpu().tolist(),
+                    "total_delta_norm": (
+                        step_total_delta.norm(
+                            dim=-1).detach().cpu().tolist()),
+                    "d_flow": (
+                        latest_dynamics.flow_delta.norm(
+                            dim=-1).detach().cpu().tolist()),
+                    "d_jump": (
+                        step_applied_jump_delta.norm(
+                            dim=-1).detach().cpu().tolist()),
+                })
+            diffusion_trace.append(trace_row)
+
         trajectory[condition_mask] = condition_data[condition_mask]
         if latest_dynamics is None:
             raise RuntimeError("P1 online sampling executed zero diffusion steps")
-        edge_time = list(range(
+
+        self._p1_online_carry_by_timestep = next_carry
+        action_time = list(range(
             current_time,
             current_time + self.horizon - 1,
         ))
+        # p(t) is indexed by the endpoint of edge t-1 -> t. Keep the
+        # action/edge-start coordinate separate so p(0) can never be emitted.
+        edge_endpoint_time = [time + 1 for time in action_time]
+        total_delta = latest_dynamics.z[:, 1:] - latest_dynamics.z[:, :-1]
+        applied_jump_delta = (
+            latest_dynamics.gate.unsqueeze(-1) * latest_dynamics.jump_delta)
         self.last_online_probe = {
-            "physical_time": edge_time,
+            "action_time": action_time,
+            "physical_time": edge_endpoint_time,
             "probability": latest_dynamics.probability[0].detach().cpu().tolist(),
             "intensity": latest_dynamics.intensity[0].detach().cpu().tolist(),
             "gate": latest_dynamics.gate[0].detach().cpu().tolist(),
+            "z": latest_dynamics.z[0].detach().cpu().tolist(),
+            "z_minus": latest_dynamics.z_minus[0].detach().cpu().tolist(),
+            "flow_delta": latest_dynamics.flow_delta[0].detach().cpu().tolist(),
+            "jump_delta": latest_dynamics.jump_delta[0].detach().cpu().tolist(),
+            "total_delta_norm": total_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "d_flow": latest_dynamics.flow_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "d_jump": applied_jump_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "d_consistency": (
+                None if latest_consistency is None
+                else float(latest_consistency[0].detach().cpu())
+            ),
+            # Descriptive aliases retained for downstream readability.
+            "flow_delta_norm": latest_dynamics.flow_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "raw_jump_delta_norm": latest_dynamics.jump_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "applied_jump_delta_norm": applied_jump_delta[0].norm(
+                dim=-1).detach().cpu().tolist(),
+            "diffusion_trace": diffusion_trace,
+            "full_diffusion_trace_stored": (
+                self.p1_online_store_full_diffusion_trace),
+            "last_committed_action_time": (
+                current_time + self.n_action_steps - 1),
+            "committed_physical_time": current_time + self.n_action_steps,
+            "carry_ratio": carry_ratio,
         }
         return trajectory
+
+    def predict_action_from_cached_feature(
+            self, feature: Tensor, previous_action: Tensor | None = None,
+            oracle_symbol: Tensor | None = None,
+        ) -> Dict[str, Tensor]:
+        """Run the online P1 sampler over one cached validation feature.
+
+        This deliberately shares the persistent history and full diffusion probe
+        path with simulator rollouts; only the observation encoder is bypassed.
+        """
+        if self.p1_mode is P1ExperimentMode.BASELINE or self.p1_model is None:
+            raise ValueError("cached-feature validation requires a P1 latent policy")
+        if feature.ndim == 2:
+            feature = feature[:, None]
+        if feature.ndim != 3 or feature.shape[1] != self.n_obs_steps:
+            raise ValueError(
+                "cached feature must have shape [B,D] when n_obs_steps=1 or "
+                "[B,n_obs_steps,D]")
+        feature = feature.to(device=self.device, dtype=self.dtype)
+        if feature.shape[-1] != self.obs_feature_dim:
+            raise ValueError("cached feature dimension does not match policy")
+        if previous_action is not None:
+            if previous_action.ndim != 2 or previous_action.shape != (feature.shape[0], self.action_dim):
+                raise ValueError("previous_action must have shape [B, action_dim]")
+            previous_action = self.normalizer["action"].normalize(
+                previous_action.to(device=self.device, dtype=self.dtype))
+        if self.p1_mode is P1ExperimentMode.ORACLE_GATE_SYMBOL:
+            if oracle_symbol is None:
+                raise ValueError("oracle cached validation requires oracle_symbol")
+            oracle_symbol = torch.as_tensor(oracle_symbol, device=self.device)
+            if oracle_symbol.shape != (feature.shape[0],):
+                raise ValueError("oracle_symbol must have shape [B]")
+            oracle_symbol = oracle_symbol.to(dtype=torch.long)
+        else:
+            oracle_symbol = None
+        initial_z = self._p1_update_online_history(
+            feature[:, -1:], previous_action, oracle_symbol)
+        shape = (feature.shape[0], self.horizon, self.action_dim)
+        if self.pred_action_steps_only:
+            shape = (feature.shape[0], self.n_action_steps, self.action_dim)
+        condition_data = torch.zeros(size=shape, device=self.device, dtype=self.dtype)
+        condition_mask = torch.zeros_like(condition_data, dtype=torch.bool)
+        nsample = self._p1_online_conditional_sample(
+            condition_data, condition_mask, feature, initial_z, oracle_symbol)
+        action_pred = self.normalizer["action"].unnormalize(
+            nsample[..., :self.action_dim])
+        if self.pred_action_steps_only:
+            action = action_pred
+        else:
+            start = self.n_obs_steps - 1
+            action = action_pred[:, start:start + self.n_action_steps]
+        return {"action": action, "action_pred": action_pred}
 
     def predict_action(self, obs_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
         if self.p1_mode is P1ExperimentMode.BASELINE:
@@ -832,8 +1123,10 @@ class P1DiffusionTransformerHybridImagePolicy(
         if self.p1_model is None:
             raise AssertionError("P1 latent inference requires p1_model")
 
-        feature, past_action = self._p1_encode_online_condition(obs_dict)
-        initial_z = self._p1_update_online_history(feature, past_action)
+        feature, past_action, oracle_symbol = (
+            self._p1_encode_online_condition(obs_dict))
+        initial_z = self._p1_update_online_history(
+            feature, past_action, oracle_symbol)
         batch = feature.shape[0]
         shape = (batch, self.horizon, self.action_dim)
         if self.pred_action_steps_only:
@@ -849,6 +1142,7 @@ class P1DiffusionTransformerHybridImagePolicy(
             condition_mask,
             feature,
             initial_z,
+            oracle_symbol,
         )
         normalized_action = nsample[..., :self.action_dim]
         action_pred = self.normalizer["action"].unnormalize(normalized_action)
