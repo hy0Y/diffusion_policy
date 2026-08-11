@@ -120,6 +120,47 @@ def test_transformers_mamba_reference_is_causal_and_differentiable():
     assert torch.isfinite(feature.grad).all()
 
 
+def test_transformers_mamba_fp32_residual_feeds_fp16_output_head():
+    class Float32Residual(torch.nn.Module):
+        def forward(self, hidden):
+            return hidden.float()
+
+    config = P1HistoryConfig(
+        feature_dim=5,
+        action_dim=3,
+        oracle_vocab_size=6,
+        oracle_dim=3,
+        model_dim=8,
+        latent_dim=4,
+        num_layers=1,
+        backend="transformers_mamba",
+        mamba_state_dim=4,
+        mamba_conv_width=2,
+        mamba_expand=1,
+    )
+    model = P1CausalHistoryEncoder(config).to(dtype=torch.float16)
+    model.sequence_layers = torch.nn.ModuleList([Float32Residual()])
+    feature = torch.randn(1, 12, 5, dtype=torch.float16, requires_grad=True)
+    action = torch.randn(1, 12, 3, dtype=torch.float16)
+    mask = torch.ones(1, 12, dtype=torch.bool)
+
+    output = model(
+        feature=feature,
+        previous_action=action,
+        valid_mask=mask,
+    )
+
+    assert output.dtype == torch.float16
+    assert torch.isfinite(output).all()
+    output.float().square().mean().backward()
+    assert feature.grad is not None
+    assert torch.isfinite(feature.grad).all()
+    assert model.output_norm.weight.grad is not None
+    assert torch.isfinite(model.output_norm.weight.grad).all()
+    assert model.history_projection.weight.grad is not None
+    assert torch.isfinite(model.history_projection.weight.grad).all()
+
+
 def test_group_oracle_gate_and_differentiable_carry():
     dynamics, history, group = small_configs()
     model = P1LatentGroupModel(

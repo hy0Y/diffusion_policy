@@ -139,7 +139,13 @@ class P1CausalHistoryEncoder(nn.Module):
         else:
             for norm, layer in zip(self.sequence_norms, self.sequence_layers):
                 hidden = hidden + layer(norm(hidden))
-        latent = self.history_projection(self.output_norm(hidden))
+        # Transformers Mamba can retain its residual stream in FP32 even when
+        # downstream parameters have been converted to a lower precision.
+        # Align explicit module boundaries without disabling residual_in_fp32.
+        hidden = hidden.to(dtype=self.output_norm.weight.dtype)
+        hidden = self.output_norm(hidden)
+        hidden = hidden.to(dtype=self.history_projection.weight.dtype)
+        latent = self.history_projection(hidden)
         return latent * valid_mask.unsqueeze(-1).to(latent.dtype)
 
     @staticmethod
