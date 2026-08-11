@@ -42,6 +42,38 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
+def summarize_rollout_outcome(rewards, max_steps):
+    reward_values = np.asarray(rewards).reshape(-1)
+    executed_steps = int(reward_values.size)
+    success_indices = np.flatnonzero(reward_values > 0)
+    if success_indices.size:
+        return {
+            "termination_reason": "task_success",
+            "success_step": int(success_indices[0]) + 1,
+            "executed_steps": executed_steps,
+        }
+    return {
+        "termination_reason": (
+            "horizon_exhausted"
+            if executed_steps >= int(max_steps)
+            else "environment_terminated"
+        ),
+        "success_step": None,
+        "executed_steps": executed_steps,
+    }
+
+
+def step_environment_then_commit_trace(
+        env, env_action, trace_writer=None, trace_row=None):
+    """Commit a trace row only after the environment accepted the action."""
+    if trace_writer is not None and trace_row is None:
+        raise RuntimeError("trace writer requires a prepared trace row")
+    transition = env.step(env_action)
+    if trace_writer is not None:
+        trace_writer.append(trace_row)
+    return transition
+
+
 def create_env(split, env_name, seed=None):
     env = gym.make(
         f"robocasa/{env_name}",
@@ -239,6 +271,7 @@ class RobomimicImageRunner(BaseImageRunner):
         # Set by the rollout worker only for offline-reference Oracle evaluation.
         self.p1_oracle_subtask_idx = None
         self.p1_trace_metadata = None
+        self.last_rollout_outcomes = []
 
     def run(self, policy: BaseImagePolicy):
         device = policy.device
@@ -337,16 +370,23 @@ class RobomimicImageRunner(BaseImageRunner):
 
                 # # Concatenate along the last axis (axis=-1)
                 # env_action = np.concatenate([env_action, base_ac_expanded], axis=-1)
+                committed_row = None
                 if trace_writer is not None:
                     oracle_idx = (
                         int(oracle_sequence[physical_step])
                         if oracle_sequence is not None else None
                     )
-                    trace_writer.append(committed_first_edge(
+                    committed_row = committed_first_edge(
                         policy.last_online_probe, action[0, 0], env_action[0, 0],
                         oracle_subtask_idx=oracle_idx,
-                    ))
-                obs, reward, done, info = env.step(env_action)
+                        reference_kind="none",
+                    )
+                obs, reward, done, info = step_environment_then_commit_trace(
+                    env,
+                    env_action,
+                    trace_writer=trace_writer,
+                    trace_row=committed_row,
+                )
                 # done = np.all(done)
                 # for robocasa switch to the proper success check
                 done = np.all(done) or np.all([this_info["success"][0] for this_info in info])
@@ -360,6 +400,10 @@ class RobomimicImageRunner(BaseImageRunner):
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+        self.last_rollout_outcomes = [
+            summarize_rollout_outcome(all_rewards[i], self.max_steps)
+            for i in range(n_inits)
+        ]
         # clear out video buffer
         _ = env.reset()
         

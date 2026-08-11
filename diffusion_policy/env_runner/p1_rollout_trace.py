@@ -8,11 +8,14 @@ from typing import Any
 import numpy as np
 
 
-VECTOR_FIELDS = (
+REQUIRED_VECTOR_FIELDS = (
     "z_before", "z_minus", "z_after", "total_delta", "flow_delta",
     "raw_jump_delta", "applied_jump_delta", "policy_action", "executed_action",
-    "reference_action",
 )
+
+OPTIONAL_VECTOR_FIELDS = ("reference_action",)
+VECTOR_FIELDS = REQUIRED_VECTOR_FIELDS + OPTIONAL_VECTOR_FIELDS
+REFERENCE_KINDS = {"none", "demonstration"}
 
 DIFFUSION_SCALAR_FIELDS = (
     "probability", "intensity", "gate", "total_delta_norm", "d_flow",
@@ -110,7 +113,8 @@ def committed_diffusion_trace(probe: dict[str, Any]) -> dict[str, np.ndarray]:
 def committed_first_edge(
         probe: dict[str, Any], policy_action: np.ndarray,
         executed_action: np.ndarray, oracle_subtask_idx: int | None = None,
-        reference_action: np.ndarray | None = None
+        reference_action: np.ndarray | None = None,
+        reference_kind: str = "none",
     ) -> dict[str, Any]:
     """Select the only latent edge committed by a one-action-step rollout."""
     if not probe:
@@ -128,6 +132,20 @@ def committed_first_edge(
         )
     gate = float(probe["gate"][0])
     raw_jump = np.asarray(probe["jump_delta"][0], dtype=np.float32)
+    if reference_kind not in REFERENCE_KINDS:
+        raise ValueError(f"unsupported reference_kind: {reference_kind}")
+    if reference_kind == "none":
+        if reference_action is not None:
+            raise ValueError(
+                "reference_kind=none cannot contain reference_action"
+            )
+        committed_reference = None
+    else:
+        if reference_action is None:
+            raise ValueError(
+                "reference_kind=demonstration requires reference_action"
+            )
+        committed_reference = np.asarray(reference_action, dtype=np.float32)
     return {
         "action_time": action_time,
         "physical_time": physical_time,
@@ -155,9 +173,8 @@ def committed_first_edge(
         "applied_jump_delta": gate * raw_jump,
         "policy_action": np.asarray(policy_action, dtype=np.float32),
         "executed_action": np.asarray(executed_action, dtype=np.float32),
-        "reference_action": np.asarray(
-            executed_action if reference_action is None else reference_action,
-            dtype=np.float32),
+        "reference_kind": reference_kind,
+        "reference_action": committed_reference,
         "_diffusion": committed_diffusion_trace(probe),
     }
 
@@ -189,6 +206,7 @@ class P1RolloutTraceWriter:
         self._scheduler_timestep: np.ndarray | None = None
         self._normalized_tau: np.ndarray | None = None
         self._metadata = dict(metadata)
+        self._reference_kind: str | None = None
         self._steps = 0
 
     @staticmethod
@@ -209,14 +227,43 @@ class P1RolloutTraceWriter:
                 "P1 trace must contain contiguous edges t->t+1 beginning at "
                 "action_time=0, physical_time=1"
             )
+        reference_kind = row.get("reference_kind")
+        if reference_kind not in REFERENCE_KINDS:
+            raise RuntimeError(
+                f"committed row has invalid reference_kind: {reference_kind}"
+            )
+        reference_action = row.get("reference_action")
+        if reference_kind == "none" and reference_action is not None:
+            raise RuntimeError(
+                "reference_kind=none cannot contain reference_action"
+            )
+        if reference_kind == "demonstration" and reference_action is None:
+            raise RuntimeError(
+                "reference_kind=demonstration requires reference_action"
+            )
+        if (
+            self._reference_kind is not None
+            and reference_kind != self._reference_kind
+        ):
+            raise RuntimeError("reference_kind changed within one trace")
+
+        vector_row = {
+            name: np.asarray(row[name], dtype=np.float32)
+            for name in REQUIRED_VECTOR_FIELDS
+        }
+        if reference_action is not None:
+            vector_row["reference_action"] = np.asarray(
+                reference_action, dtype=np.float32
+            )
         scalar = {
             key: value for key, value in row.items()
             if key not in VECTOR_FIELDS and key != "_diffusion"
         }
         self._jsonl.write(json.dumps(scalar, sort_keys=True) + "\n")
         self._jsonl.flush()
-        for name in VECTOR_FIELDS:
-            self._vectors[name].append(np.asarray(row[name], dtype=np.float32))
+        for name, values in vector_row.items():
+            self._vectors[name].append(values)
+        self._reference_kind = reference_kind
 
         scheduler_timestep = np.asarray(
             diffusion["scheduler_timestep"], dtype=np.int32)
@@ -366,6 +413,9 @@ class P1RolloutTraceWriter:
                 "first_committed_edge_at_every_diffusion_timestep"),
             "steps": self._steps,
             "vector_dtype": "float32",
+            "reference_kind": self._reference_kind,
+            "reference_action_present": "reference_action" in arrays,
+            "trajectory_vector_signals": sorted(arrays),
             "jsonl_path": str(self.jsonl_path),
             "npz_path": str(self.npz_path),
             "diffusion_jsonl_path": str(self.diffusion_jsonl_path),
