@@ -1,4 +1,4 @@
-from typing import Union, Optional, Tuple, NamedTuple
+from typing import Union, Optional, Tuple
 import logging
 import torch
 import torch.nn as nn
@@ -6,14 +6,6 @@ from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosE
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 logger = logging.getLogger(__name__)
-
-
-class DecoderSplitState(NamedTuple):
-    """Intermediate state for checkpoint-compatible decoder split-forward."""
-
-    hidden: torch.Tensor
-    memory: torch.Tensor
-    split_layer: int
 
 class TransformerForDiffusion(ModuleAttrMixin):
     def __init__(self,
@@ -274,124 +266,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             optim_groups, lr=learning_rate, betas=betas
         )
         return optimizer
-
-    def _prepare_decoder_inputs(
-            self,
-            sample: torch.Tensor,
-            timestep: Union[torch.Tensor, float, int],
-            cond: Optional[torch.Tensor],
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Embed the action tokens and condition memory used by the decoder."""
-        if self.encoder_only or self.decoder is None:
-            raise RuntimeError("decoder split-forward requires decoder mode")
-
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor(
-                [timesteps], dtype=torch.long, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        timesteps = timesteps.expand(sample.shape[0])
-        time_emb = self.time_emb(timesteps).unsqueeze(1)
-
-        cond_embeddings = time_emb
-        if self.obs_as_cond:
-            if cond is None:
-                raise ValueError("cond is required when obs_as_cond=True")
-            cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
-        tc = cond_embeddings.shape[1]
-        cond_position = self.cond_pos_emb[:, :tc, :]
-        memory = self.encoder(self.drop(cond_embeddings + cond_position))
-
-        token_embeddings = self.input_emb(sample)
-        token_count = token_embeddings.shape[1]
-        token_position = self.pos_emb[:, :token_count, :]
-        hidden = self.drop(token_embeddings + token_position)
-        return hidden, memory
-
-    def _run_decoder_layer_range(
-            self,
-            hidden: torch.Tensor,
-            memory: torch.Tensor,
-            *,
-            start_layer: int,
-            end_layer: int,
-        ) -> torch.Tensor:
-        if self.decoder is None:
-            raise RuntimeError("decoder layer range requires decoder mode")
-        layer_count = len(self.decoder.layers)
-        if not 0 <= start_layer <= end_layer <= layer_count:
-            raise ValueError(
-                f"decoder layer range [{start_layer}, {end_layer}) is outside "
-                f"[0, {layer_count})")
-        for layer in self.decoder.layers[start_layer:end_layer]:
-            hidden = layer(
-                hidden,
-                memory,
-                tgt_mask=self.mask,
-                memory_mask=self.memory_mask,
-                tgt_is_causal=self.mask is not None,
-                memory_is_causal=False,
-            )
-        return hidden
-
-    def forward_decoder_pre(
-            self,
-            sample: torch.Tensor,
-            timestep: Union[torch.Tensor, float, int],
-            cond: Optional[torch.Tensor] = None,
-            *,
-            split_layer: int = 9,
-        ) -> DecoderSplitState:
-        """Run decoder layers ``[0, split_layer)`` and expose token hidden.
-
-        The Human300 P1 path uses ``split_layer=9`` for a 12-layer decoder. This
-        method adds no parameters or state-dict keys, so existing checkpoints
-        remain strict-load compatible.
-        """
-        hidden, memory = self._prepare_decoder_inputs(sample, timestep, cond)
-        hidden = self._run_decoder_layer_range(
-            hidden,
-            memory,
-            start_layer=0,
-            end_layer=split_layer,
-        )
-        return DecoderSplitState(
-            hidden=hidden,
-            memory=memory,
-            split_layer=split_layer,
-        )
-
-    def forward_decoder_post(
-            self,
-            state: DecoderSplitState,
-            *,
-            hidden: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
-        """Run the remaining decoder layers and prediction head.
-
-        ``hidden`` may contain a trainable residual such as P1's zero-initialized
-        latent-to-hidden feedback. Frozen post-block parameters can therefore
-        remain frozen while gradients still flow back to that residual.
-        """
-        if self.decoder is None:
-            raise RuntimeError("decoder split-forward requires decoder mode")
-        if hidden is None:
-            hidden = state.hidden
-        elif hidden.shape != state.hidden.shape:
-            raise ValueError(
-                f"replacement hidden shape {hidden.shape} does not match "
-                f"pre-block hidden shape {state.hidden.shape}")
-        hidden = self._run_decoder_layer_range(
-            hidden,
-            state.memory,
-            start_layer=state.split_layer,
-            end_layer=len(self.decoder.layers),
-        )
-        if self.decoder.norm is not None:
-            hidden = self.decoder.norm(hidden)
-        return self.head(self.ln_f(hidden))
 
     def forward(self, 
         sample: torch.Tensor, 

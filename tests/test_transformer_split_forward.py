@@ -1,13 +1,13 @@
 import pytest
 import torch
 
-from diffusion_policy.model.diffusion.transformer_for_diffusion import (
-    TransformerForDiffusion,
+from diffusion_policy.model.diffusion.jump_transformer_for_diffusion import (
+    JumpTransformerForDiffusion,
 )
 
 
-def make_decoder() -> TransformerForDiffusion:
-    model = TransformerForDiffusion(
+def make_decoder() -> JumpTransformerForDiffusion:
+    model = JumpTransformerForDiffusion(
         input_dim=4,
         output_dim=4,
         horizon=6,
@@ -27,7 +27,7 @@ def make_decoder() -> TransformerForDiffusion:
     return model
 
 
-def test_decoder_9_10_split_matches_original_forward():
+def test_jump_decoder_split_matches_unsplit_forward():
     torch.manual_seed(7)
     model = make_decoder()
     sample = torch.randn(2, 6, 4)
@@ -70,7 +70,7 @@ def test_frozen_post_block_preserves_feedback_input_gradient():
 
 
 def test_split_forward_rejects_encoder_only_model():
-    model = TransformerForDiffusion(
+    model = JumpTransformerForDiffusion(
         input_dim=4,
         output_dim=4,
         horizon=6,
@@ -80,4 +80,5 @@ def test_split_forward_rejects_encoder_only_model():
         time_as_cond=False,
     )
     with pytest.raises(RuntimeError, match="decoder mode"):
-        model.forward_decoder_pre(torch.randn(1, 6, 4), 1)
+        model.forward_decoder_pre(
+            torch.randn(1, 6, 4), 1, split_layer=1)

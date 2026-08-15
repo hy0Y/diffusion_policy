@@ -1,0 +1,95 @@
+name: dp_gettoastedbread_milestone_v1
+source_task: GetToastedBread
+ckpt_path: /data/sem_bif/checkpoints/robocasa365/diffusion_policy/human300/diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/epoch=0500-test_mean_score=-1.000.ckpt
+ckpt_state_key: ema_model
+
+shape_meta: &shape_meta
+  obs:
+    robot0_agentview_right_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_agentview_right]
+    robot0_agentview_left_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_agentview_left]
+    robot0_eye_in_hand_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_eye_in_hand]
+    robot0_base_to_eef_pos:
+      shape: [3]
+      lerobot_keys: [state.end_effector_position_relative]
+    robot0_base_to_eef_quat:
+      shape: [4]
+      lerobot_keys: [state.end_effector_rotation_relative]
+    robot0_gripper_qpos:
+      shape: [2]
+      lerobot_keys: [state.gripper_qpos]
+    lang_emb:
+      shape: [768]
+  action:
+    shape: [12]
+    lerobot_keys:
+      - action.end_effector_position
+      - action.end_effector_rotation
+      - action.gripper_close
+      - action.base_motion
+      - action.control_mode
+
+abs_action: &abs_action false
+
+env_runner:
+  _target_: diffusion_policy.env_runner.milestone_robomimic_image_runner.MilestoneRobomimicImageRunner
+  dataset_path: /mnt/amlfs-01/shared/robocasa_benchmark/robocasa-datasets/v1.0/test/atomic/PnPCounterToCabinet/20250811/demo.hdf5
+  shape_meta: *shape_meta
+  n_train: 0
+  n_train_vis: 0
+  n_test: 1
+  n_test_vis: 1
+  test_start_seed: 100000
+  max_steps: 900
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  render_obs_key: robot0_agentview_right_image
+  fps: 10
+  crf: 22
+  past_action: false
+  return_executed_observations: false
+  abs_action: *abs_action
+  tqdm_interval_sec: 1.0
+  n_envs: 1
+  env_kwargs:
+    split: target
+    env_name: GetToastedBread
+    seed: 1111111
+    reset_mode: generated_seed
+    episode_root: null
+    initial_state_index: 0
+  milestone_evaluation:
+    enabled: true
+    required: true
+    spec_target: robocasa_milestones.specs.get_toasted_bread_v1:GetToastedBreadV1Spec
+    expected_task_name: GetToastedBread
+    expected_spec_id: robocasa365/GetToastedBread/physical_milestones
+    expected_spec_version: "1.1.0"
+    fixed_horizon: ${task.env_runner.max_steps}
+    environment_source_revision: b4684e6ee37d377cc392e98302a6b916d588b415
+    spec_kwargs:
+      navigation_xy_threshold: 0.20
+      navigation_orientation_cosine_threshold: 0.98
+
+dataset:
+  _target_: diffusion_policy.dataset.lerobot_dataset.LerobotCotrainingDataset
+  shape_meta: *shape_meta
+  dataset_soup: posttrain_composite_seen
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  abs_action: *abs_action
+  rotation_rep: rotation_6d
+  use_legacy_normalizer: false
+  use_cache: true
+  seed: 42
+  val_ratio: 0.02

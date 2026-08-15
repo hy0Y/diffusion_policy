@@ -1,0 +1,18 @@
+defaults:
+  - train_diffusion_transformer_hybrid_workspace
+  - override task: robocasa/dp_gettoastedbread_milestone_v1
+  - _self_
+
+name: dp_gettoastedbread_milestone_v3
+architecture_id: dp_vanilla
+exp_name: ${name}
+
+training:
+  resume: false
+
+logging:
+  project: sem_bif_p1
+  mode: offline
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}_seed${training.seed}
+  tags: [p1, dp, v3, milestone, GetToastedBread]
+  group: dp_gettoastedbread_milestone_v3

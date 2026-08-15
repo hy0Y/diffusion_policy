@@ -1,0 +1,12 @@
+defaults:
+  - train_jump_diffusion_transformer_hybrid_workspace
+  - override task: robocasa/jump_gettoastedbread_milestone_v1
+  - _self_
+
+name: jump_gettoastedbread_milestone_v3
+architecture_id: dp_jump
+exp_name: ${name}
+
+logging:
+  tags: [p1, jump, v3, milestone, GetToastedBread]
+  group: jump_gettoastedbread_milestone_v3

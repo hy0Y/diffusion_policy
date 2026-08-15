@@ -70,7 +70,8 @@ class MultiStepWrapper(gym.Wrapper):
             n_obs_steps, 
             n_action_steps, 
             max_episode_steps=None,
-            reward_agg_method='max'
+            reward_agg_method='max',
+            return_executed_observations=False,
         ):
         super().__init__(env)
         self._action_space = repeated_space(env.action_space, n_action_steps)
@@ -79,7 +80,8 @@ class MultiStepWrapper(gym.Wrapper):
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.reward_agg_method = reward_agg_method
-        self.n_obs_steps = n_obs_steps
+        self.return_executed_observations = bool(
+            return_executed_observations)
 
         self.obs = deque(maxlen=n_obs_steps+1)
         self.reward = list()
@@ -102,6 +104,7 @@ class MultiStepWrapper(gym.Wrapper):
         """
         actions: (n_action_steps,) + action_shape
         """
+        executed_observations = []
         for act in action:
             if len(self.done) > 0 and self.done[-1]:
                 # termination
@@ -109,6 +112,7 @@ class MultiStepWrapper(gym.Wrapper):
             observation, reward, done, info = super().step(act)
 
             self.obs.append(observation)
+            executed_observations.append(observation)
             self.reward.append(reward)
             if (self.max_episode_steps is not None) \
                 and (len(self.reward) >= self.max_episode_steps):
@@ -121,7 +125,33 @@ class MultiStepWrapper(gym.Wrapper):
         reward = aggregate(self.reward, self.reward_agg_method)
         done = aggregate(self.done, 'max')
         info = dict_take_last_n(self.info, self.n_obs_steps)
+        if self.return_executed_observations:
+            info["executed_observations"] = self._stack_observations(
+                executed_observations)
+            info["executed_length"] = np.int64(len(executed_observations))
         return observation, reward, done, info
+
+    def _stack_observations(self, observations):
+        """Return every observation produced by the latest action segment."""
+        if isinstance(self.env.observation_space, spaces.Box):
+            if observations:
+                return np.stack(observations, axis=0)
+            return np.empty(
+                (0,) + self.env.observation_space.shape,
+                dtype=self.env.observation_space.dtype,
+            )
+        if isinstance(self.env.observation_space, spaces.Dict):
+            result = {}
+            for key, space in self.env.observation_space.spaces.items():
+                if observations:
+                    result[key] = np.stack(
+                        [value[key] for value in observations], axis=0)
+                else:
+                    result[key] = np.empty(
+                        (0,) + space.shape, dtype=space.dtype)
+            return result
+        raise RuntimeError(
+            f"Unsupported observation space {type(self.env.observation_space)}")
 
     def _get_obs(self, n_steps=1):
         """

@@ -1,0 +1,143 @@
+name: jump_gettoastedbread_milestone_v1
+
+shape_meta: &shape_meta
+  obs:
+    robot0_agentview_right_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_agentview_right]
+    robot0_agentview_left_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_agentview_left]
+    robot0_eye_in_hand_image:
+      shape: [3, 256, 256]
+      type: rgb
+      lerobot_keys: [video.robot0_eye_in_hand]
+    robot0_base_to_eef_pos:
+      shape: [3]
+      lerobot_keys: [state.end_effector_position_relative]
+    robot0_base_to_eef_quat:
+      shape: [4]
+      lerobot_keys: [state.end_effector_rotation_relative]
+    robot0_gripper_qpos:
+      shape: [2]
+      lerobot_keys: [state.gripper_qpos]
+    lang_emb:
+      shape: [768]
+  action:
+    shape: [12]
+    lerobot_keys:
+      - action.end_effector_position
+      - action.end_effector_rotation
+      - action.gripper_close
+      - action.base_motion
+      - action.control_mode
+
+ckpt_path: /data/sem_bif/checkpoints/robocasa365/diffusion_policy/human300/diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/epoch=0500-test_mean_score=-1.000.ckpt
+ckpt_state_key: ema_model
+source_task: GetToastedBread
+split_artifact: ${oc.env:P1_MVP_SPLIT_ARTIFACT,/data/sem_bif/derived/p1_composite_seen_split/split_manifest.json}
+split_manifest_sha256: 1ead92ce1b88d0fdd038b57b56b33a16be482d871099a32aad6360fe97ee6f53
+annotation_root: /data/sem_bif/derived/annotations/v1/composite_seen/GetToastedBread
+cache_root: /data/sem_bif/derived/features/v1_center_random4/composite_seen/GetToastedBread
+expected_train_episodes: 450
+expected_validation_episodes: 25
+history_feature_variant: 0
+
+env_runner:
+  _target_: diffusion_policy.env_runner.milestone_robomimic_image_runner.MilestoneRobomimicImageRunner
+  dataset_path: /mnt/amlfs-01/shared/robocasa_benchmark/robocasa-datasets/v1.0/test/atomic/PnPCounterToCabinet/20250811/demo.hdf5
+  shape_meta: *shape_meta
+  n_train: 0
+  n_train_vis: 0
+  n_test: 1
+  n_test_vis: 1
+  test_start_seed: 100000
+  max_steps: 900
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  render_obs_key: robot0_agentview_right_image
+  fps: 10
+  crf: 22
+  past_action: false
+  return_executed_observations: true
+  abs_action: false
+  tqdm_interval_sec: 1.0
+  n_envs: 1
+  env_kwargs:
+    split: target
+    env_name: GetToastedBread
+    seed: 1111111
+    reset_mode: generated_seed
+    episode_root: null
+    initial_state_index: 0
+  milestone_evaluation:
+    enabled: true
+    required: true
+    spec_target: robocasa_milestones.specs.get_toasted_bread_v1:GetToastedBreadV1Spec
+    expected_task_name: GetToastedBread
+    expected_spec_id: robocasa365/GetToastedBread/physical_milestones
+    expected_spec_version: "1.1.0"
+    fixed_horizon: ${task.env_runner.max_steps}
+    environment_source_revision: b4684e6ee37d377cc392e98302a6b916d588b415
+    spec_kwargs:
+      navigation_xy_threshold: 0.20
+      navigation_orientation_cosine_threshold: 0.98
+
+train_dataset:
+  _target_: diffusion_policy.dataset.jump_mvp_chunk_dataset.JumpMVPChunkDataset
+  split_artifact: ${task.split_artifact}
+  split: train
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  edge_dt_seconds: ${policy.jump_edge_dt_seconds}
+  seed: ${training.seed}
+  feature_variant: ${task.history_feature_variant}
+  category_quota: ${sampling.category_quota}
+  natural_done_policy: ${sampling.natural_done_policy}
+  task: ${task.source_task}
+  annotation_root: ${task.annotation_root}
+  cache_root: ${task.cache_root}
+  canonical_sha256: ${task.split_manifest_sha256}
+
+validation_dataset:
+  _target_: diffusion_policy.dataset.jump_mvp_chunk_dataset.JumpMVPChunkDataset
+  split_artifact: ${task.split_artifact}
+  split: validation
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  edge_dt_seconds: ${policy.jump_edge_dt_seconds}
+  seed: ${validation.seed}
+  feature_variant: ${task.history_feature_variant}
+  category_quota: ${sampling.category_quota}
+  natural_done_policy: ${sampling.natural_done_policy}
+  task: ${task.source_task}
+  annotation_root: ${task.annotation_root}
+  cache_root: ${task.cache_root}
+  canonical_sha256: ${task.split_manifest_sha256}
+
+cache_normalizer:
+  format_version: linear_normalizer_transform_v1
+  transform_sha256: 1bb9ab96a35b00e1aa840fcb642362f1db972d1733dc6d37a29935faac8761b0
+  source:
+    cache_release: v1_center_random4
+    dataset_soup: target_composite_seen
+    statistics: merged_metadata
+    expected_episode_count: 8000
+    expected_frame_count: 5954038
+  fields:
+    action: {kind: identity, size: 12}
+    lang_emb: {kind: identity, size: 768}
+    robot0_agentview_left_image: {kind: image_range}
+    robot0_agentview_right_image: {kind: image_range}
+    robot0_eye_in_hand_image: {kind: image_range}
+    robot0_base_to_eef_quat: {kind: identity, size: 4}
+    robot0_base_to_eef_pos:
+      kind: affine
+      scale: [1.4062104225158691, 1.1704314947128296, 1.4565727710723877]
+      offset: [-0.2607501149177551, -0.00012028217315673828, -0.5545661449432373]
+    robot0_gripper_qpos:
+      kind: affine
+      scale: [25.115785598754883, 26.718080520629883]
+      offset: [-0.4979690909385681, 0.8230366706848145]

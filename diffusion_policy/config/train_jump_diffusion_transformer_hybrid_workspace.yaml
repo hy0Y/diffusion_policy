@@ -1,0 +1,155 @@
+defaults:
+  - _self_
+  - task: robocasa/jump_gettoastedbread_mvp
+
+name: dp_jump_mvp_v3
+architecture_id: dp_jump
+_target_: diffusion_policy.workspace.train_jump_diffusion_transformer_hybrid_workspace.TrainJumpDiffusionTransformerHybridWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: ${name}
+
+horizon: 10
+n_obs_steps: 2
+n_action_steps: 8
+obs_as_cond: true
+
+policy:
+  _target_: diffusion_policy.policy.jump_diffusion_transformer_hybrid_image_policy.JumpDiffusionTransformerHybridImagePolicy
+  shape_meta: ${shape_meta}
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  crop_shape: [224, 224]
+  obs_encoder_group_norm: true
+  eval_fixed_crop: true
+  n_layer: 12
+  n_cond_layers: 4
+  n_head: 8
+  n_emb: 512
+  p_drop_emb: 0.0
+  p_drop_attn: 0.3
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: ${obs_as_cond}
+  # Keep the full vanilla horizon; Jump begins internally at n_obs_steps-1.
+  pred_action_steps_only: false
+  jump_split_layer: 9
+  jump_history_backend: selective_ssm
+  jump_history_model_dim: 128
+  jump_history_layers: 2
+  jump_history_state_dim: 16
+  jump_history_conv_width: 4
+  jump_history_expand: 2
+  jump_latent_dim: 32
+  jump_flow_condition_dim: 64
+  jump_condition_dim: 64
+  jump_projector_hidden_dim: 256
+  jump_dynamics_hidden_dim: 128
+  jump_feedback_hidden_dim: 256
+  jump_edge_dt_seconds: 0.05
+  jump_beta_boundary: 0.10
+  jump_teacher_force_until: 0.40
+  jump_teacher_force_end: 0.60
+  jump_freeze_host: true
+  jump_store_full_diffusion_trace: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+optimizer:
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 1.0e-6
+  jump_weight_decay: 1.0e-3
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
+
+sampling:
+  natural_done_policy: include_terminal
+  category_quota:
+    boundary_centered: 16
+    near_negative: 16
+    interior: 16
+    natural: 8
+    episode_start: 2
+
+dataloader:
+  # Independent chunks are the batch unit. Re-profile before a full run.
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: false
+  drop_last: true
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+
+validation:
+  seed: 4242
+
+training:
+  seed: 42
+  resume: false
+  resume_checkpoint: null
+  num_epochs: 50
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 375
+  max_train_steps: null
+  max_grad_norm: 1.0
+  use_ema: true
+  validation_enabled: true
+  val_every: 5
+  checkpoint_every: 5
+  validation_only: false
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: sem_bif_p1
+  mode: offline
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}_seed${training.seed}
+  tags:
+    - p1
+    - jump
+    - v3
+    - ${task_name}
+  id: null
+  group: jump_gettoastedbread_mvp
+  resume: allow
+
+checkpoint:
+  topk:
+    monitor_key: val_loss_total
+    mode: min
+    k: 3
+    format_str: epoch={epoch:04d}-val_loss={val_loss_total:.6f}.ckpt
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: ${oc.env:SEM_BIF_HYDRA_RUN_DIR,data/outputs/jump/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}}
+  sweep:
+    dir: ${oc.env:SEM_BIF_HYDRA_RUN_DIR,data/outputs/jump/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_seed${training.seed}}
+    subdir: ${hydra.job.num}

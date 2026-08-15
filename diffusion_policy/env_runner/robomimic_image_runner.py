@@ -21,8 +21,8 @@ from pathlib import Path
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.env_runner.p1_rollout_trace import (
-    P1RolloutTraceWriter, committed_first_edge,
+from diffusion_policy.env_runner.executed_segment import (
+    collate_executed_segments,
 )
 from diffusion_policy.env.robomimic.seeded_robomimic_image_wrapper import (
     SeededRobomimicImageWrapper,
@@ -65,7 +65,7 @@ def summarize_rollout_outcome(rewards, max_steps):
 
 def step_environment_then_commit_trace(
         env, env_action, trace_writer=None, trace_row=None):
-    """Commit a trace row only after the environment accepted the action."""
+    """Append an optional diagnostic row only after a successful env step."""
     if trace_writer is not None and trace_row is None:
         raise RuntimeError("trace writer requires a prepared trace row")
     transition = env.step(env_action)
@@ -105,6 +105,7 @@ class RobomimicImageRunner(BaseImageRunner):
             fps=10,
             crf=22,
             past_action=False,
+            return_executed_observations=False,
             abs_action=False,
             tqdm_interval_sec=5.0,
             n_envs=None,
@@ -116,6 +117,9 @@ class RobomimicImageRunner(BaseImageRunner):
             n_envs = n_train + n_test
 
         # assert n_obs_steps <= n_action_steps
+        if past_action and return_executed_observations:
+            raise ValueError(
+                "past_action and executed-segment history are mutually exclusive")
         robosuite_fps = 20
         steps_per_render = max(robosuite_fps // fps, 1)
 
@@ -169,7 +173,8 @@ class RobomimicImageRunner(BaseImageRunner):
                 ),
                 n_obs_steps=n_obs_steps,
                 n_action_steps=n_action_steps,
-                max_episode_steps=max_steps
+                max_episode_steps=max_steps,
+                return_executed_observations=return_executed_observations,
             )
         
         # For each process the OpenGL context can only be initialized once
@@ -203,7 +208,8 @@ class RobomimicImageRunner(BaseImageRunner):
                 ),
                 n_obs_steps=n_obs_steps,
                 n_action_steps=n_action_steps,
-                max_episode_steps=max_steps
+                max_episode_steps=max_steps,
+                return_executed_observations=return_executed_observations,
             )
 
         env_fns = [partial(env_fn, env_i) for env_i in range(n_envs)]
@@ -261,6 +267,8 @@ class RobomimicImageRunner(BaseImageRunner):
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.past_action = past_action
+        self.return_executed_observations = bool(
+            return_executed_observations)
         self.max_steps = max_steps
         self.rotation_transformer = rotation_transformer
         self.abs_action = abs_action
@@ -268,9 +276,6 @@ class RobomimicImageRunner(BaseImageRunner):
         self.reset_mode = reset_mode
         self.episode_root = episode_root
         self.initial_state_index = initial_state_index
-        # Set by the rollout worker only for offline-reference Oracle evaluation.
-        self.p1_oracle_subtask_idx = None
-        self.p1_trace_metadata = None
         self.last_rollout_outcomes = []
 
     def run(self, policy: BaseImagePolicy):
@@ -289,16 +294,6 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
-        is_p1 = bool(getattr(policy, "is_p1_latent", False))
-        if is_p1 and (n_envs != 1 or self.n_action_steps != 1):
-            raise RuntimeError("P1 committed trace requires n_envs=1 and n_action_steps=1")
-        oracle_sequence = self.p1_oracle_subtask_idx
-        trace_writer = (
-            P1RolloutTraceWriter(self.output_dir, self.p1_trace_metadata or {})
-            if is_p1 else None
-        )
-        physical_step = 0
-
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
             end = min(n_inits, start + n_envs)
@@ -319,6 +314,7 @@ class RobomimicImageRunner(BaseImageRunner):
             # start rollout
             obs = env.reset()
             past_action = None
+            executed_segment = None
             policy.reset()
 
             env_name = self.env_kwargs['env_name']
@@ -329,11 +325,8 @@ class RobomimicImageRunner(BaseImageRunner):
             while not done:
                 # create obs dict
                 np_obs_dict = dict(obs)
-                if oracle_sequence is not None:
-                    if physical_step >= len(oracle_sequence):
-                        raise RuntimeError("offline Oracle sequence exhausted during rollout")
-                    np_obs_dict['oracle_symbol'] = np.asarray(
-                        [oracle_sequence[physical_step]], dtype=np.int64)
+                if executed_segment is not None:
+                    np_obs_dict.update(executed_segment)
                 if self.past_action and (past_action is not None):
                     # TODO: not tested
                     np_obs_dict['past_action'] = past_action[
@@ -370,28 +363,13 @@ class RobomimicImageRunner(BaseImageRunner):
 
                 # # Concatenate along the last axis (axis=-1)
                 # env_action = np.concatenate([env_action, base_ac_expanded], axis=-1)
-                committed_row = None
-                if trace_writer is not None:
-                    oracle_idx = (
-                        int(oracle_sequence[physical_step])
-                        if oracle_sequence is not None else None
-                    )
-                    committed_row = committed_first_edge(
-                        policy.last_online_probe, action[0, 0], env_action[0, 0],
-                        oracle_subtask_idx=oracle_idx,
-                        reference_kind="none",
-                    )
-                obs, reward, done, info = step_environment_then_commit_trace(
-                    env,
-                    env_action,
-                    trace_writer=trace_writer,
-                    trace_row=committed_row,
-                )
+                obs, reward, done, info = env.step(env_action)
                 # done = np.all(done)
                 # for robocasa switch to the proper success check
                 done = np.all(done) or np.all([this_info["success"][0] for this_info in info])
+                if self.return_executed_observations:
+                    executed_segment = collate_executed_segments(info, action)
                 past_action = action
-                physical_step += action.shape[1]
 
                 # update pbar
                 pbar.update(action.shape[1])
@@ -410,8 +388,6 @@ class RobomimicImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
-        if trace_writer is not None:
-            log_data.update(trace_writer.finalize())
         log_data['evaluation/reset_mode'] = reset_mode
         log_data['evaluation/environment_seeds'] = (
             list(self.env_seeds) if reset_mode == "generated_seed" else [])
